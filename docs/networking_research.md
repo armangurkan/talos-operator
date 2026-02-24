@@ -292,7 +292,7 @@ metadata:
   namespace: fleet
 spec:
   endpoint: "10.0.1.11"
-  version: "v1.10.3"
+  version: "v1.11.0"
   controlPlaneRef:
     name: prod-controlplane
   machineSpec:
@@ -342,7 +342,12 @@ type VirtualMachineDisk struct {
 
 This only supports local Proxmox storage. No iSCSI target, no IOPS limits, no multi-disk ordering.
 
-**Talos** has no built-in mount path concept for data disks — it only knows about the install disk (`/machine/install/disk`). For persistent storage, Talos 1.8+ supports `VolumeConfig` resources for arbitrary disk management, and the `extraMounts` field for raw bind mounts.
+**Talos** has no built-in mount path concept for data disks — it only knows about the install disk (`/machine/install/disk`). For persistent storage:
+- **Talos 1.8+**: `VolumeConfig` resources for **system volumes** only (`EPHEMERAL`, `IMAGECACHE`) — no filesystem or mount fields ([VolumeConfig reference](https://docs.siderolabs.com/talos/v1.9/reference/configuration/block/volumeconfig/))
+- **Talos 1.11+**: `UserVolumeConfig` for **user-defined data volumes** — supports `filesystem.type` (xfs/ext4) and auto-mounts at `/var/mnt/<name>` ([UserVolumeConfig reference](https://docs.siderolabs.com/talos/v1.12/reference/configuration/block/uservolumeconfig/))
+- **Talos <1.11**: Use `extraMounts` in machine config for raw bind mounts (less declarative)
+
+**This proposal targets Talos v1.11+** to leverage `UserVolumeConfig` for declarative data disk management.
 
 ### Proposed Changes
 
@@ -417,75 +422,75 @@ For iSCSI disks, Proxmox supports them via the `iscsi` storage type. The disk wo
 scsi1: iscsi:iqn.2026-01.com.example:lun1/0,size=24G
 ```
 
-#### B. talos-operator — Talos VolumeConfig for Data Disks
+#### B. talos-operator — Talos UserVolumeConfig for Data Disks
 
-Talos 1.8+ `VolumeConfig` allows declaring disk volumes. These get appended to the machine config as separate YAML documents (the operator already does this for ImageCache in `talosmachine_controller.go:203`).
+Talos 1.11+ `UserVolumeConfig` allows declaring user data volumes with filesystem formatting and auto-mounting. These get appended to the machine config as separate YAML documents (the operator already does this for ImageCache `VolumeConfig` in `talosmachine_controller.go:203` — see `pkg/talos/bundle.go:31-39` for the existing `ImageCacheVolumeConfig` template).
 
-**File**: `talos-operator/pkg/talos/bundle.go` — Add volume config templates:
+**File**: `talos-operator/pkg/talos/bundle.go` — Add user volume config templates alongside existing templates (line 40):
 
 ```go
-// VolumeConfigTemplate for data disks
-// Appended as multi-doc YAML after the machine config
-var VolumeConfigTemplate = `
+// UserVolumeConfigTemplate for data disks (Talos 1.11+)
+// Appended as multi-doc YAML after the machine config.
+// Auto-mounts at /var/mnt/<name>.
+// Ref: https://docs.siderolabs.com/talos/v1.12/reference/configuration/block/uservolumeconfig/
+var UserVolumeConfigTemplate = `
 ---
 apiVersion: v1alpha1
-kind: VolumeConfig
+kind: UserVolumeConfig
 name: %s
 provisioning:
   diskSelector:
     match: '%s'
-  grow: true
   minSize: %s
   maxSize: %s
-  fileSystems:
-    - type: xfs
-      label: %s
-mount:
-  path: %s
+filesystem:
+  type: %s
 `
 ```
 
-**File**: `talos-operator/api/v1alpha1/talosmachine_types.go` — Add to MachineSpec:
+**Note**: `UserVolumeConfig` auto-mounts at `/var/mnt/<name>`. There is no explicit `mount.path` field — the mount path is derived from the volume `name`. For example, a volume named `data-shard-1` mounts at `/var/mnt/data-shard-1`.
+
+**File**: `talos-operator/api/v1alpha1/talosmachine_types.go` — Add to `MachineSpec` (currently at line 55-88):
 
 ```go
-// PROPOSED addition to MachineSpec
+// PROPOSED addition to MachineSpec (after existing fields: InstallDisk, Wipe, Image, Meta, etc.)
 type MachineSpec struct {
     // ... existing fields (InstallDisk, Image, AirGap, etc.) ...
 
-    // DataVolumes defines additional disk volumes to configure in Talos.
-    // Each volume maps a disk to a mount path with optional size constraints.
+    // DataVolumes defines additional disk volumes to configure in Talos via UserVolumeConfig.
+    // Each volume selects a disk via CEL expression and auto-mounts at /var/mnt/<name>.
+    // Requires Talos 1.11+.
     // +kubebuilder:validation:Optional
     DataVolumes []DataVolume `json:"dataVolumes,omitempty"`
 }
 
 type DataVolume struct {
-    // Name of the volume (e.g., "data-24g-1")
+    // Name of the volume (e.g., "data-shard-1"). Determines mount path: /var/mnt/<name>.
     Name string `json:"name"`
-    // DiskSelector is a CEL expression to match the disk in Talos
-    // (e.g., "disk.size > 20u * GB && disk.size < 30u * GB")
+    // DiskSelector is a CEL expression to match the disk in Talos.
+    // Available properties: disk.size, disk.transport, disk.serial, disk.bus_path, disk.model.
+    // Ref: https://docs.siderolabs.com/talos/v1.11/configure-your-talos-cluster/storage-and-disk-management/disk-management/common/
     DiskSelector string `json:"diskSelector"`
-    // MountPath where this volume is mounted (e.g., "/var/data/shard-1")
-    MountPath string `json:"mountPath"`
     // MinSize (e.g., "24GiB")
     // +kubebuilder:validation:Optional
     MinSize string `json:"minSize,omitempty"`
     // MaxSize (e.g., "24GiB")
     // +kubebuilder:validation:Optional
     MaxSize string `json:"maxSize,omitempty"`
-    // Filesystem type (default: xfs)
+    // Filesystem type (default: xfs). Supported: xfs, ext4.
     // +kubebuilder:default="xfs"
     FSType string `json:"fsType,omitempty"`
 }
 ```
 
-In the controller, volume configs are generated and appended to the machine config bytes (same pattern as `ImageCacheVolumeConfig`):
+In the controller, user volume configs are generated and appended to the machine config bytes (same pattern as `ImageCacheVolumeConfig` at `bundle.go:31-39`):
 
 ```go
 // In handleControlPlaneMachine() or handleWorkerMachine():
 if tm.Spec.MachineSpec != nil && len(tm.Spec.MachineSpec.DataVolumes) > 0 {
     for _, vol := range tm.Spec.MachineSpec.DataVolumes {
-        volConfig := fmt.Sprintf(talos.VolumeConfigTemplate,
-            vol.Name, vol.DiskSelector, vol.MinSize, vol.MaxSize, vol.Name, vol.MountPath)
+        volConfig := fmt.Sprintf(talos.UserVolumeConfigTemplate,
+            vol.Name, vol.DiskSelector, vol.MinSize, vol.MaxSize, vol.FSType)
         *cpConfig = append(*cpConfig, []byte(volConfig)...)
     }
 }
@@ -535,24 +540,22 @@ metadata:
   name: prod-worker-0
 spec:
   endpoint: "10.0.1.21"
-  version: "v1.10.3"
+  version: "v1.11.0"
   workerRef:
     name: prod-workers
   machineSpec:
     dataVolumes:
+      # Each volume auto-mounts at /var/mnt/<name> via Talos UserVolumeConfig
       - name: data-shard-1
-        diskSelector: "disk.transport == 'scsi' && disk.size > 20u * GB && disk.size < 30u * GB"
-        mountPath: /var/data/shard-1
+        diskSelector: "disk.transport == 'scsi' && disk.size > 20u * GiB && disk.size < 30u * GiB"
         minSize: "24GiB"
         maxSize: "24GiB"
       - name: data-shard-2
-        diskSelector: "disk.transport == 'scsi' && disk.busPath == '/dev/sdc'"
-        mountPath: /var/data/shard-2
+        diskSelector: "disk.transport == 'scsi' && disk.serial == 'lun-24g-002'"
         minSize: "24GiB"
         maxSize: "24GiB"
       - name: data-large
-        diskSelector: "disk.size > 60u * GB"
-        mountPath: /var/data/large
+        diskSelector: "disk.size > 60u * GiB"
         minSize: "64GiB"
         maxSize: "64GiB"
         fsType: xfs
@@ -656,7 +659,7 @@ Talos exposes disk metadata that the `VolumeConfig` `diskSelector` CEL expressio
 |---|---|---|
 | `disk.size` | Disk capacity | `24000000000` (bytes) |
 | `disk.transport` | Bus type | `"scsi"` |
-| `disk.busPath` | Kernel device path | `"/dev/sdb"` |
+| `disk.bus_path` | Kernel device path | `"/dev/sdb"` |
 | `disk.serial` | Disk serial number | `"lun-24g-001"` (from iSCSI target) |
 | `disk.name` | Kernel name | `"sdb"` |
 
@@ -666,50 +669,46 @@ Talos exposes disk metadata that the `VolumeConfig` `diskSelector` CEL expressio
 disk.transport == 'scsi' && disk.serial == 'lun-24g-001'
 ```
 
-#### Phase 4: VolumeConfig Mounts the Disk
+#### Phase 4: UserVolumeConfig Mounts the Disk
 
-The `VolumeConfig` resource (appended to the machine config as a multi-doc YAML) handles the full lifecycle:
+The `UserVolumeConfig` resource (Talos 1.11+, appended to the machine config as a multi-doc YAML) handles the full lifecycle ([UserVolumeConfig reference](https://docs.siderolabs.com/talos/v1.12/reference/configuration/block/uservolumeconfig/)):
 
 ```
 1. Boot → Talos machined enumerates disks
-2. VolumeConfig.diskSelector → CEL expression evaluated against each disk
+2. UserVolumeConfig.diskSelector → CEL expression evaluated against each disk
 3. Match found → Check provisioning constraints (minSize, maxSize)
-4. Disk unformatted? → Format with specified filesystem (xfs)
-5. Label filesystem → e.g., "data-shard-1"
-6. Mount at specified path → e.g., /var/data/shard-1
-7. Grow if needed → If `grow: true` and disk is larger than current FS
+4. Disk unformatted? → Format with specified filesystem (xfs or ext4)
+5. Mount at /var/mnt/<name> → e.g., /var/mnt/data-shard-1
 ```
 
-The rendered VolumeConfig for an iSCSI LUN:
+The rendered UserVolumeConfig for an iSCSI LUN:
 
 ```yaml
 ---
 apiVersion: v1alpha1
-kind: VolumeConfig
+kind: UserVolumeConfig
 name: data-shard-1
 provisioning:
   diskSelector:
     match: 'disk.transport == "scsi" && disk.serial == "lun-24g-001"'
-  grow: true
   minSize: 24GiB
   maxSize: 24GiB
-  fileSystems:
-    - type: xfs
-      label: data-shard-1
-mount:
-  path: /var/data/shard-1
+filesystem:
+  type: xfs
 ```
+
+**Mount path**: Auto-mounted at `/var/mnt/data-shard-1` (derived from `name` field).
 
 #### Phase 5: Failure Modes and Mitigations
 
 | Failure | Impact | Mitigation |
 |---|---|---|
 | **iSCSI portal unreachable at boot** | VM BIOS/UEFI may stall waiting for SCSI devices. Talos boot delayed but not blocked (boot disk is local). | Proxmox retries the iSCSI initiator session. VolumeConfig mounts are non-blocking — Talos boots with the local disk and mounts data volumes when they become available. |
-| **LUN path changes** (different SCSI bus position) | `/dev/sdb` may become `/dev/sdc` after reboot. | Use `disk.serial` in diskSelector, not `disk.busPath`. Serial is stable across reboots; bus position is not. |
+| **LUN path changes** (different SCSI bus position) | `/dev/sdb` may become `/dev/sdc` after reboot. | Use `disk.serial` in diskSelector, not `disk.bus_path`. Serial is stable across reboots; bus position is not. |
 | **iSCSI session timeout** (storage network flap) | Mounted filesystem goes read-only or I/O errors. | Proxmox iSCSI initiator handles reconnection. For the application layer, workloads should use retry logic. Consider `noop` scheduler for iSCSI disks. |
 | **Multipath** (multiple paths to same LUN) | Duplicate block devices visible to Talos. | Not applicable in single-portal configurations. If multipath is needed, configure it at the Proxmox level (DM-Multipath on the host), not inside the VM. The VM sees a single SCSI device regardless. |
 | **Disk serial collision** (two LUNs with same serial) | diskSelector matches multiple disks — VolumeConfig fails. | Enforce unique zvol names in the IQN naming convention. kubemox should validate serial uniqueness across all iSCSI disks attached to the same VM. |
-| **VolumeConfig format on wrong disk** | Data loss if diskSelector matches the boot disk. | Always include `disk.size` or `disk.serial` constraints. The boot disk has a different size and serial. The `Talos install disk` is excluded from VolumeConfig by default. |
+| **UserVolumeConfig format on wrong disk** | Data loss if diskSelector matches the boot disk. | Always include `disk.serial` constraints. The boot disk has a different serial. Use `!system_disk` in CEL if needed (only available after installation). |
 
 #### Example: Complete iSCSI Worker Node
 
@@ -771,27 +770,25 @@ metadata:
   namespace: fleet
 spec:
   endpoint: "10.0.1.21"
-  version: "v1.10.3"
+  version: "v1.11.0"
   workerRef:
     name: prod-workers
   machineSpec:
     dataVolumes:
       # Match by serial — stable across reboots, independent of bus enumeration
+      # Each volume auto-mounts at /var/mnt/<name> via Talos UserVolumeConfig
       - name: data-shard-1
         diskSelector: 'disk.transport == "scsi" && disk.serial == "lun-24g-001"'
-        mountPath: /var/data/shard-1
         minSize: "24GiB"
         maxSize: "24GiB"
         fsType: xfs
       - name: data-shard-2
         diskSelector: 'disk.transport == "scsi" && disk.serial == "lun-24g-002"'
-        mountPath: /var/data/shard-2
         minSize: "24GiB"
         maxSize: "24GiB"
         fsType: xfs
       - name: data-large
         diskSelector: 'disk.transport == "scsi" && disk.serial == "lun-64g-001"'
-        mountPath: /var/data/large
         minSize: "64GiB"
         maxSize: "64GiB"
         fsType: xfs
@@ -810,15 +807,15 @@ spec:
 ┌─────────────┐     ┌──────────────┐     ┌─────────────────┐     ┌──────────────┐
 │ ZFS Pool     │     │ Proxmox Host │     │ VM (Talos)      │     │ Talos Init   │
 │              │     │              │     │                 │     │              │
-│ zvol/lun-001 │────▶│ iSCSI Target │────▶│ /dev/sdb (SCSI) │────▶│ VolumeConfig │
-│ (24 GiB)     │ TCP │ LIO/targetcli│ PCI │ serial: lun-001 │ CEL │ match serial │
-│              │ 3260│              │pass-│                 │     │ format xfs   │
-│              │     │ iscsi-zfs-   │thru │                 │     │ mount /var/  │
-│              │     │ pool storage │     │                 │     │ data/shard-1 │
+│ zvol/lun-001 │────▶│ iSCSI Target │────▶│ /dev/sdb (SCSI) │────▶│ UserVolume   │
+│ (24 GiB)     │ TCP │ LIO/targetcli│ PCI │ serial: lun-001 │ CEL │ Config       │
+│              │ 3260│              │pass-│                 │     │ match serial │
+│              │     │ iscsi-zfs-   │thru │                 │     │ format xfs   │
+│              │     │ pool storage │     │                 │     │ /var/mnt/... │
 └─────────────┘     └──────────────┘     └─────────────────┘     └──────────────┘
 
 kubemox role:                              talos-operator role:
-  - Register iSCSI storage (if needed)       - Generate VolumeConfig YAML
+  - Register iSCSI storage (if needed)       - Generate UserVolumeConfig YAML
   - Attach LUN as SCSI device                - Match by disk.serial (stable)
   - Set IOPS limits                          - Append to machine config
   - Report disk status                       - Apply via Talos API
@@ -886,6 +883,10 @@ type VirtualMachineSpec struct {
     ConnectionRef      *corev1.LocalObjectReference  `json:"connectionRef,omitempty"`
     // NEW: VMID allows specifying a deterministic Proxmox VM ID.
     // If 0, Proxmox auto-assigns the next available ID.
+    // Proxmox VMIDs are integers in range 100-999999999 (regex: ^[1-9][0-9]{2,8}$).
+    // VMIDs <100 are reserved for internal purposes. VMIDs must be cluster-wide unique.
+    // Ref: https://pve.proxmox.com/pve-docs/qm.1.html
+    // Ref: https://git.proxmox.com/?p=pve-common.git;a=blob_plain;f=src/PVE/JSONSchema.pm
     // +kubebuilder:validation:Optional
     // +kubebuilder:validation:Minimum=100
     // +kubebuilder:validation:Maximum=999999999
@@ -920,7 +921,7 @@ spec:
   connectionRef:
     name: proxmox-main
   template:
-    name: talos-v1.10-nocloud
+    name: talos-v1.11-nocloud
     cores: 4
     memory: 8192
 ```
@@ -950,55 +951,39 @@ With VMID assignment (Shortcoming 3), ordering becomes implicit:
 - CP nodes get VMIDs 10100-10102 → talos-operator creates TalosMachine CRs in order
 - Workers get VMIDs 10110-10112 → only created after CP is bootstrapped
 
+**Note on Proxmox VMIDs**: Proxmox VM IDs are **integers only**, in the range **100 to 999,999,999**. No string-based, UUID-based, or zero-prefixed identifiers are supported. The `VMID` field in kubemox enforces this with kubebuilder validation markers (`Minimum=100`, `Maximum=999999999`).
+
+#### Design Decision: IPAM Is Not the Operator's Responsibility
+
+**Static IP assignment means 1:1 explicit assignment** — each `TalosMachine` declares its own IP address, gateway, and MAC. The talos-operator does **not** allocate IPs from a pool, increment from a start address, or perform any IPAM function.
+
+IPAM (IP Address Management) is a separate concern that belongs to one of these external systems:
+
+| IPAM Approach | How It Works | Integration Point |
+|---|---|---|
+| **Manual assignment** | Operator or platform engineer assigns IPs in the CR spec | Direct: IPs written into `TalosMachine.spec.networkSpec.ipAddress` |
+| **Crossplane composition** | Composition pipeline receives explicit IPs as inputs (from a spreadsheet, CMDB, or parameter store) and templates them into generated CRs | Composition `spec.resources[].patches` |
+| **CAPI IPAM provider** | `InClusterIPPool` / `GlobalInClusterIPPool` from [cluster-api-ipam-provider-in-cluster](https://github.com/kubernetes-sigs/cluster-api-ipam-provider-in-cluster) allocates IPs and writes them to `IPAddressClaim` resources | Crossplane or controller reads `IPAddress` resources |
+| **Proxmox SDN IPAM** | Proxmox 8.1+ SDN module with built-in IPAM (PVE, NetBox, or phpIPAM backend). API: `GET /cluster/sdn/vnets/<vnet>/subnets/<subnet>/ips` | External controller or Crossplane function queries the Proxmox SDN API before generating CRs |
+| **External IPAM operator** | NetBox, Infoblox, or similar IPAM system with a Kubernetes operator that fulfills `IPAddressClaim` resources | Same pattern as CAPI IPAM provider |
+
+This separation follows the single-responsibility principle: talos-operator manages Talos machine lifecycle, kubemox manages Proxmox VMs, and IPAM is handled by the appropriate external system.
+
 **File**: `talos-operator/api/v1alpha1/taloscontrolplane_types.go:93`
 
+The `MetalSpec` struct does **not** change for IPAM. It retains its existing `Machines` list (machine endpoints) and `MachineSpec` (shared config). Each `TalosMachine` CR carries its own `NetworkSpec` with an explicit 1:1 IP assignment:
+
 ```go
-// CURRENT
+// MetalSpec remains unchanged — no IPAM logic
 type MetalSpec struct {
+    // Machines is a list of machine endpoints (IPs or hostnames).
+    // Each entry corresponds to a TalosMachine CR with its own NetworkSpec.
     Machines    []string     `json:"machines,omitempty"`
     MachineSpec *MachineSpec `json:"machineSpec,omitempty"`
 }
-
-// PROPOSED — add NetworkAllocation for deterministic IP + VMID assignment
-type MetalSpec struct {
-    Machines    []string     `json:"machines,omitempty"`
-    MachineSpec *MachineSpec `json:"machineSpec,omitempty"`
-    // NetworkAllocation defines how IPs and VMIDs are assigned to machines.
-    // +kubebuilder:validation:Optional
-    NetworkAllocation *NetworkAllocation `json:"networkAllocation,omitempty"`
-}
-
-type NetworkAllocation struct {
-    // Subnet in CIDR notation (e.g., "10.0.1.0/24")
-    Subnet string `json:"subnet"`
-    // Gateway for all machines
-    Gateway string `json:"gateway"`
-    // StartIP is the first IP to allocate. Subsequent machines get +1.
-    StartIP string `json:"startIP"`
-    // StartVMID is the first Proxmox VMID. Subsequent machines get +1.
-    // +kubebuilder:validation:Optional
-    StartVMID int `json:"startVMID,omitempty"`
-    // Nameservers
-    Nameservers []string `json:"nameservers,omitempty"`
-    // VIP for control plane HA
-    VIP string `json:"vip,omitempty"`
-}
 ```
 
-The TalosControlPlane controller assigns IPs and VMIDs sequentially:
-
-```go
-func (r *TalosControlPlaneReconciler) allocateForMachine(
-    alloc *NetworkAllocation, index int,
-) (ip string, vmid int) {
-    ip = incrementIP(net.ParseIP(alloc.StartIP), index).String()
-    vmid = 0
-    if alloc.StartVMID > 0 {
-        vmid = alloc.StartVMID + index
-    }
-    return
-}
-```
+The IPs in `MetalSpec.Machines` must match the `NetworkSpec.IPAddress` on the corresponding `TalosMachine` CRs. This is a **declarative 1:1 mapping** — no allocation, no incrementing, no pool management.
 
 ---
 
@@ -1055,17 +1040,24 @@ spec:
         - pve-worker-1
         - pve-worker-2
 
-  # Networking — single source of truth
+  # Networking — explicit 1:1 IP assignment per machine (IPAM is external)
   network:
     controlPlane:
       subnet: "10.0.1.0/24"
       gateway: "10.0.1.1"
-      startIP: "10.0.1.11"
       vip: "10.0.1.10"
+      # Explicit IPs — not auto-calculated. Source: manual, IPAM operator, or Proxmox SDN IPAM.
+      machines:
+        - ip: "10.0.1.11"
+        - ip: "10.0.1.12"
+        - ip: "10.0.1.13"
     workers:
       subnet: "10.0.1.0/24"
       gateway: "10.0.1.1"
-      startIP: "10.0.1.21"
+      machines:
+        - ip: "10.0.1.21"
+        - ip: "10.0.1.22"
+        - ip: "10.0.1.23"
     nameservers:
       - "10.0.1.1"
       - "8.8.8.8"
@@ -1076,14 +1068,14 @@ spec:
   proxmox:
     connectionRef:
       name: proxmox-main
-    templateName: talos-v1.10-nocloud
+    templateName: talos-v1.11-nocloud
     storage:
       bootDisk: local-lvm
       dataDisk: zfs-pool
 
   # Talos
   talos:
-    version: "v1.10.3"
+    version: "v1.11.0"
     kubeVersion: "v1.33.1"
 
   # VMID range: 10100-10199
@@ -1102,7 +1094,7 @@ TalosKubernetesCluster (Claim)
 ├── VirtualMachine: prod-cluster-wk-0    (vmid: 10110, node: pve-worker-1, ip: 10.0.1.21, 3 data disks)
 ├── VirtualMachine: prod-cluster-wk-1    (vmid: 10111, node: pve-worker-2, ip: 10.0.1.22, 3 data disks)
 ├── VirtualMachine: prod-cluster-wk-2    (vmid: 10112, node: pve-worker-1, ip: 10.0.1.23, 3 data disks)
-├── TalosControlPlane: prod-cluster-cp   (endpoint: https://10.0.1.10:6443, vip: 10.0.1.10)
+├── TalosControlPlane: prod-cluster-cp   (endpoint: https://10.0.1.10:6443, machines: [10.0.1.11, 10.0.1.12, 10.0.1.13])
 ├── TalosWorker: prod-cluster-workers    (controlPlaneRef: prod-cluster-cp)
 ├── TalosMachine: prod-cluster-cp-0      (ip: 10.0.1.11, networkSpec, no dataVolumes)
 ├── TalosMachine: prod-cluster-cp-1      (ip: 10.0.1.12, networkSpec, no dataVolumes)
@@ -1240,19 +1232,60 @@ spec:
               endpoint: "https://{{ $s.network.controlPlane.vip }}:6443"
               metalSpec:
                 machines:
-                  {{- range $i := until (int $s.controlPlane.replicas) }}
-                  - "{{ incrementIP $s.network.controlPlane.startIP $i }}"
+                  # Explicit 1:1 IPs — no IPAM in the operator. IPs come from the Claim.
+                  {{- range $i, $m := $s.network.controlPlane.machines }}
+                  - "{{ $m.ip }}"
                   {{- end }}
-                networkAllocation:
-                  subnet: {{ $s.network.controlPlane.subnet }}
-                  gateway: {{ $s.network.controlPlane.gateway }}
-                  startIP: {{ $s.network.controlPlane.startIP }}
-                  startVMID: {{ $s.vmidBase }}
-                  vip: {{ $s.network.controlPlane.vip }}
-                  nameservers: {{ toYaml $s.network.nameservers | nindent 20 }}
 
-    # Step 4: TalosMachines (generated by talos-operator from TalosControlPlane)
-    # Not in composition — talos-operator creates these automatically
+    # Step 4: TalosMachines with explicit NetworkSpec
+    # Each TalosMachine gets its own 1:1 IP assignment from the Claim.
+    - step: talos-machines
+      functionRef:
+        name: function-go-templating
+      input:
+        apiVersion: gotemplating.fn.crossplane.io/v1beta1
+        kind: GoTemplate
+        source: Inline
+        inline:
+          template: |
+            {{- $s := .observed.composite.resource.spec }}
+            {{- range $i, $m := $s.network.controlPlane.machines }}
+            ---
+            apiVersion: talos.alperen.cloud/v1alpha1
+            kind: TalosMachine
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: cp-tm-{{ $i }}
+            spec:
+              endpoint: "{{ $m.ip }}"
+              version: {{ $s.talos.version }}
+              controlPlaneRef:
+                name: "{{ $s.metadata.name }}-cp"
+              networkSpec:
+                ipAddress: "{{ $m.ip }}"
+                cidr: 24
+                gateway: "{{ $s.network.controlPlane.gateway }}"
+                nameservers: {{ toYaml $s.network.nameservers | nindent 18 }}
+                vip: "{{ $s.network.controlPlane.vip }}"
+            {{ end }}
+            {{- range $i, $m := $s.network.workers.machines }}
+            ---
+            apiVersion: talos.alperen.cloud/v1alpha1
+            kind: TalosMachine
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: wk-tm-{{ $i }}
+            spec:
+              endpoint: "{{ $m.ip }}"
+              version: {{ $s.talos.version }}
+              workerRef:
+                name: "{{ $s.metadata.name }}-workers"
+              networkSpec:
+                ipAddress: "{{ $m.ip }}"
+                cidr: 24
+                gateway: "{{ $s.network.workers.gateway }}"
+                nameservers: {{ toYaml $s.network.nameservers | nindent 18 }}
+            {{ end }}
 ```
 
 ### End-to-End Flow
@@ -1265,29 +1298,27 @@ spec:
 3. Crossplane composition resolves:
    ├── 3 CP VirtualMachine CRs (vmid: 10100-10102)
    ├── 3 Worker VirtualMachine CRs (vmid: 10110-10112, with data disks + IOPS)
-   ├── 1 TalosControlPlane CR (with networkAllocation)
+   ├── 1 TalosControlPlane CR (machines: [10.0.1.11, 10.0.1.12, 10.0.1.13])
+   ├── 3 CP TalosMachine CRs (each with explicit 1:1 networkSpec)
+   ├── 3 Worker TalosMachine CRs (each with explicit 1:1 networkSpec)
    └── 1 TalosWorker CR
    |
 4. kubemox reconciles VirtualMachine CRs:
-   ├── Clones template with specified VMID
+   ├── Clones template with specified VMID (integer 100-999999999)
    ├── Configures disks with IOPS limits
    ├── Attaches SR-IOV VF via PCI passthrough
    ├── Reports MAC address in status
    └── Starts VMs
    |
 5. talos-operator reconciles TalosControlPlane:
-   ├── Sees networkAllocation: startIP=10.0.1.11, startVMID=10100
-   ├── Creates TalosMachine CRs:
-   │   ├── cp-0: endpoint=10.0.1.11, networkSpec={ip, mac, vip}
-   │   ├── cp-1: endpoint=10.0.1.12, networkSpec={ip, mac, vip}
-   │   └── cp-2: endpoint=10.0.1.13, networkSpec={ip, mac, vip}
-   └── (MAC addresses come from kubemox VM status)
+   ├── Machines list contains explicit IPs (no IPAM — IPs assigned externally)
+   └── TalosMachine CRs already exist (created by Crossplane) with 1:1 networkSpec
    |
 6. talos-operator reconciles each TalosMachine:
-   ├── Apply META key (pre-install network via metakey_tpl.go)
+   ├── Apply META key 0x0a (pre-install network via metakey_tpl.go:3-47)
    ├── Generate machine config with:
    │   ├── Static network patch (deviceSelector.hardwareAddr)
-   │   ├── VolumeConfig for data disks
+   │   ├── UserVolumeConfig for data disks (Talos 1.11+)
    │   └── VIP for control plane
    ├── Apply config via Talos API
    ├── Talos installs → reboots at SAME IP
@@ -1302,29 +1333,34 @@ spec:
 
 ### kubemox (5 changes)
 
-| Change | File | Description |
+| Change | File (current line refs) | Description |
 |---|---|---|
-| Add `MACAddress` to `VirtualMachineNetwork` | `api/proxmox/v1alpha1/virtualmachine_types.go` | Allow setting/reading MAC |
-| Add `MACAddress` to `QEMUStatus` | Same file | Report MAC in status |
-| Add `VMID` to `VirtualMachineSpec` | Same file | Deterministic VM IDs |
-| Add `IOPSLimit`, `MBpsLimit`, `ISCSI` to `VirtualMachineDisk` | Same file | iSCSI + IOPS support |
-| Pass VMID in `CloneOptions`, read MAC after clone | `pkg/proxmox/virtualmachine.go` | Wire up new fields |
+| Add `MACAddress` to `VirtualMachineNetwork` | `api/proxmox/v1alpha1/virtualmachine_types.go:142-147` | Allow setting/reading MAC |
+| Add `MACAddress` to `QEMUStatus` | Same file, line 149 | Report MAC in status |
+| Add `VMID` to `VirtualMachineSpec` | Same file, line 34 (struct starts here) | Deterministic VM IDs (integer 100-999999999) |
+| Add `IOPSLimit`, `MBpsLimit`, `ISCSI` to `VirtualMachineDisk` | Same file, line 132 | iSCSI + IOPS support |
+| Pass VMID in `CloneOptions`, read MAC after clone | `pkg/proxmox/virtualmachine.go:111-118` (`CreateVMFromTemplate`) | Wire up new fields |
+
+**kubemox concurrency**: `VMmaxConcurrentReconciles = 30` (`internal/controller/proxmox/virtualmachine_controller.go:51`)
 
 ### go-proxmox fork (1 change)
 
-| Change | File | Description |
-|---|---|---|
-| Add `NewID` to `VirtualMachineCloneOptions` | `types.go` | Support `newid` in clone API |
-
-### talos-operator (5 changes)
+Import: `github.com/luthermonson/go-proxmox v0.3.2` → replaced by `github.com/alperencelik/go-proxmox v0.0.0-20260201203053-5a1bc2aed607` (see `kubemox/go.mod:9,23`)
 
 | Change | File | Description |
 |---|---|---|
-| Add `NetworkSpec` to `TalosMachineSpec` | `api/v1alpha1/talosmachine_types.go` | Static IP + SR-IOV config |
-| Add `DataVolume` to `MachineSpec` | Same file | Multi-disk mount paths |
-| Add `NetworkAllocation` to `MetalSpec` | `api/v1alpha1/taloscontrolplane_types.go` | Deterministic IP + VMID allocation |
-| Static network patch generation | `pkg/talos/bundle.go` | New patch templates |
-| Apply network + volume patches | `internal/controller/talosmachine_controller.go` | Wire into reconcile loop |
+| Add `NewID` to `VirtualMachineCloneOptions` | `types.go` | Support `newid` parameter in Proxmox `POST /nodes/{node}/qemu/{vmid}/clone` API |
+
+### talos-operator (4 changes)
+
+| Change | File (current line refs) | Description |
+|---|---|---|
+| Add `NetworkSpec` to `TalosMachineSpec` | `api/v1alpha1/talosmachine_types.go` (after line 53) | Static IP + SR-IOV config per machine (1:1 explicit assignment) |
+| Add `DataVolume` to `MachineSpec` | Same file (after line 88) | UserVolumeConfig-based data disk management (Talos 1.11+) |
+| Static network + UserVolumeConfig patch generation | `pkg/talos/bundle.go` (after line 40) | New patch templates alongside existing ones |
+| Apply network + volume patches | `internal/controller/talosmachine_controller.go` (in `metalConfigPatches()` at line 431) | Wire into reconcile loop |
+
+**Note**: `MetalSpec` (`taloscontrolplane_types.go:93-99`) is **unchanged** — no IPAM logic added. IPAM is an external concern.
 
 ### Crossplane (new)
 
@@ -1338,16 +1374,70 @@ spec:
 
 ## Key References
 
-- [Official Talos Proxmox Guide (v1.11)](https://www.talos.dev/v1.11/talos-guides/install/virtualized-platforms/proxmox/)
-- [Talos Metal Network Configuration](https://www.talos.dev/v1.10/advanced/metal-network-configuration/)
+### Talos Linux
+
+- [Talos Proxmox Guide (v1.11)](https://www.talos.dev/v1.11/talos-guides/install/virtualized-platforms/proxmox/)
+- [Talos Metal Network Configuration](https://docs.siderolabs.com/talos/v1.11/networking/metal-network-configuration/) — META key `0x0a` documentation
+- [Talos deviceSelector Reference](https://docs.siderolabs.com/talos/v1.11/networking/device-selector/) — `hardwareAddr`, `busPath`, `driver`, `pciID`, `permanentAddr`, `physical`
+- [Talos Configuration v1alpha1 Reference](https://docs.siderolabs.com/talos/v1.11/reference/configuration/v1alpha1/config/) — `NetworkDeviceSelector` struct
+- [Talos VolumeConfig Reference (v1.9)](https://docs.siderolabs.com/talos/v1.9/reference/configuration/block/volumeconfig/) — System volumes only (`EPHEMERAL`, `IMAGECACHE`)
+- [Talos UserVolumeConfig Reference (v1.12)](https://docs.siderolabs.com/talos/v1.12/reference/configuration/block/uservolumeconfig/) — User data volumes with filesystem and auto-mount
+- [Talos Disk Management CEL Expressions](https://docs.siderolabs.com/talos/v1.11/configure-your-talos-cluster/storage-and-disk-management/disk-management/common/) — `disk.serial`, `disk.bus_path`, `disk.transport`, `disk.size`, `disk.model`
+- [Talos Static Addressing](https://docs.siderolabs.com/talos/v1.12/networking/configuration/static)
 - [Talos Nocloud Documentation](https://docs.siderolabs.com/talos/v1.8/platform-specific-installations/cloud-platforms/nocloud)
 - [Talos Image Factory](https://factory.talos.dev/)
-- [Talos Static Addressing Docs](https://docs.siderolabs.com/talos/v1.12/networking/configuration/static)
+- [GitHub Issue #11651 - Guest Agent in Maintenance Mode](https://github.com/siderolabs/talos/issues/11651)
+
+### Proxmox VE
+
+- [Proxmox VMID Specification (qm man page)](https://pve.proxmox.com/pve-docs/qm.1.html) — `<vmid>: <integer> (100 - 999999999)`
+- [Proxmox VMID Source Code (JSONSchema.pm)](https://git.proxmox.com/?p=pve-common.git;a=blob_plain;f=src/PVE/JSONSchema.pm) — Regex: `^[1-9][0-9]{2,8}$`
+- [Proxmox Admin Guide - VMID Auto-Selection](https://pve.proxmox.com/pve-docs/pve-admin-guide.html#pvecm_next_id_range) — Default range 100-1,000,000
+- [Proxmox SDN Documentation](https://pve.proxmox.com/pve-docs/chapter-pvesdn.html) — SDN zones, VNets, subnets, IPAM
+- [Proxmox SDN Wiki](https://pve.proxmox.com/wiki/Software-Defined_Network) — PVE IPAM, phpIPAM, NetBox backends
+- [Proxmox SDN IPAM Source Code](https://git.proxmox.com/?p=pve-network.git;a=tree;f=src/PVE/API2/Network/SDN;hb=HEAD) — API paths confirmed
+- [Proxmox iSCSI Storage](https://pve.proxmox.com/wiki/Storage:_iSCSI)
+- [Proxmox PCI Passthrough / SR-IOV](https://pve.proxmox.com/wiki/PCI_Passthrough)
+- [Proxmox VM Cloning and MAC Behavior](https://forum.proxmox.com/threads/when-cloning-a-kvm-vm-the-mac-address-is-renewed.28153/)
+
+### IPAM Ecosystem
+
+- [cluster-api-ipam-provider-in-cluster](https://github.com/kubernetes-sigs/cluster-api-ipam-provider-in-cluster) — `InClusterIPPool`, `GlobalInClusterIPPool` (API group: `ipam.cluster.x-k8s.io`)
+- [CAPI IPAM Provider Contract](https://cluster-api.sigs.k8s.io/developer/providers/contracts/ipam) — `IPAddressClaim` / `IPAddress` CRDs
+- [CAPI IPAM Integration Proposal](https://github.com/kubernetes-sigs/cluster-api/blob/main/docs/proposals/20220125-ipam-integration.md)
+
+### Other
+
 - [JYSK Tech: 3000+ Clusters with NoCloud](https://jysk.tech/3000-clusters-part-3-how-to-boot-talos-linux-nodes-with-cloud-init-and-nocloud-acdce36f60c0)
 - [siderolabs/omni-infra-provider-proxmox](https://github.com/siderolabs/omni-infra-provider-proxmox)
-- [pfSense REST API](https://github.com/jaredhendrickson13/pfsense-api)
-- [pfSense Go Client](https://github.com/sjafferali/pfsense-api-goclient)
-- [GitHub Issue #11651 - Guest Agent in Maintenance Mode](https://github.com/siderolabs/talos/issues/11651)
-- [Proxmox VM Cloning and MAC Behavior](https://forum.proxmox.com/threads/when-cloning-a-kvm-vm-the-mac-address-is-renewed.28153/)
-- [Proxmox iSCSI Storage](https://pve.proxmox.com/wiki/Storage:_iSCSI)
-- [Proxmox SR-IOV Resource Mappings](https://pve.proxmox.com/wiki/PCI_Passthrough)
+
+### Codebase References (Current State)
+
+#### kubemox (`armangurkan/kubemox`, branch `claude/general-session-UY36F`)
+
+| File | Line | Symbol |
+|---|---|---|
+| `api/proxmox/v1alpha1/virtualmachine_types.go` | 34 | `VirtualMachineSpec` struct |
+| Same | 96 | `VirtualMachineSpecTemplate` struct (with `PciDevices []PciDevice`) |
+| Same | 117 | `PciDevice` struct (`type: raw\|mapped`, `deviceID`) |
+| Same | 132 | `VirtualMachineDisk` struct (Storage, Size, Device — no iSCSI/IOPS yet) |
+| Same | 142 | `VirtualMachineNetwork` struct (Model, Bridge — no MAC yet) |
+| Same | 149 | `QEMUStatus` struct (State, Node, Uptime, ID, IPAddress — no MAC yet) |
+| `pkg/proxmox/virtualmachine.go` | 92 | `CreateVMFromTemplate()` function |
+| Same | 111-118 | `CloneOptions` setup (Full, Name, Target — no VMID yet) |
+| Same | 607 | `UpdateVMStatus()` function |
+| `internal/controller/proxmox/virtualmachine_controller.go` | 51 | `VMmaxConcurrentReconciles = 30` |
+| `go.mod` | 9, 23 | go-proxmox fork: `alperencelik/go-proxmox v0.0.0-20260201203053-5a1bc2aed607` |
+
+#### talos-operator (`armangurkan/talos-operator`, branch `claude/general-session-UY36F`)
+
+| File | Line | Symbol |
+|---|---|---|
+| `api/v1alpha1/talosmachine_types.go` | 28 | `TalosMachineSpec` struct (Endpoint, Version, MachineSpec, ControlPlaneRef, WorkerRef) |
+| Same | 55 | `MachineSpec` struct (InstallDisk, Wipe, Image, Meta — no NetworkSpec/DataVolumes yet) |
+| `api/v1alpha1/taloscontrolplane_types.go` | 93 | `MetalSpec` struct (Machines []string, MachineSpec) |
+| Same | 101 | `META` struct (Hostname, Interface, Subnet, Gateway, DNSServers) |
+| `pkg/talos/bundle.go` | 22-40 | Existing patch templates (InstallDisk, InstallImage, WipeDisk, AirGapp, ImageCache, ImageCacheVolumeConfig) |
+| `pkg/talos/metakey_tpl.go` | 3-47 | `metaKeyTemplate` — META key 0x0a network config template |
+| `pkg/talos/client.go` | 185 | `ApplyMetaKey()` function |
+| `internal/controller/talosmachine_controller.go` | 431 | `metalConfigPatches()` function |
