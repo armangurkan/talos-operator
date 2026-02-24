@@ -562,6 +562,268 @@ spec:
     gateway: "10.0.1.1"
 ```
 
+### iSCSI End-to-End Flow
+
+The proposed `ISCSIDisk` struct and `VolumeConfig` templates establish the **types**, but the end-to-end lifecycle of an iSCSI disk — from ZFS pool to mounted filesystem inside Talos — requires understanding the full data path across Proxmox, kubemox, the VM, and Talos.
+
+#### Phase 1: ZFS Pool → iSCSI Target (Proxmox Host)
+
+Proxmox exposes ZFS zvols as iSCSI targets via its built-in iSCSI target implementation (LIO/targetcli) or through an external SAN appliance. Each LUN maps to a zvol in a ZFS pool:
+
+```
+ZFS Pool: zfs-pool
+├── zvol: zfs-pool/lun-24g-001   (24 GiB)   → iqn.2026-01.com.infra:zfs-pool-lun-24g-001
+├── zvol: zfs-pool/lun-24g-002   (24 GiB)   → iqn.2026-01.com.infra:zfs-pool-lun-24g-002
+├── zvol: zfs-pool/lun-64g-001   (64 GiB)   → iqn.2026-01.com.infra:zfs-pool-lun-64g-001
+└── ...
+```
+
+**IQN naming convention**: `iqn.<year>-<month>.<reversed-domain>:<pool>-<purpose>-<index>`
+
+**Portal**: The Proxmox host's storage network IP + port 3260 (e.g., `10.0.2.5:3260`).
+
+On Proxmox, the iSCSI storage must be registered before VMs can use it:
+
+```bash
+# Register the iSCSI storage pool in Proxmox (one-time setup per portal)
+pvesm add iscsi iscsi-zfs-pool \
+  --portal 10.0.2.5 \
+  --target iqn.2026-01.com.infra:zfs-pool \
+  --content images
+```
+
+This makes the iSCSI LUNs available as disk sources for VMs.
+
+#### Phase 2: kubemox Creates VM with iSCSI Disks
+
+When kubemox reconciles a `VirtualMachine` CR that contains `ISCSIDisk` entries, it translates them to Proxmox API calls:
+
+```
+VirtualMachine CR                     Proxmox API
+─────────────────                     ───────────
+disk:                                 POST /nodes/{node}/qemu/{vmid}/config
+  - device: scsi1                     → scsi1: iscsi-zfs-pool:0.0.1/lun-24g-001,size=24G
+    iscsi:
+      targetIQN: "...lun-24g-001"
+      portal: "10.0.2.5:3260"
+      lun: 0
+    iopsLimit: 500                    → iops_rd=500,iops_wr=500
+```
+
+**kubemox controller flow** (`pkg/proxmox/virtualmachine.go`):
+
+```go
+func (pc *ProxmoxClient) attachISCSIDisk(vmid int, nodeName string, disk VirtualMachineDisk) error {
+    // 1. Verify the iSCSI storage is registered on the target Proxmox node
+    //    GET /nodes/{node}/storage → check for iscsi type matching portal+target
+
+    // 2. Resolve the LUN to a Proxmox volume identifier
+    //    The format is: <storage-id>:<target-iqn-suffix>/<lun>
+    //    e.g., "iscsi-zfs-pool:0.0.1/lun-24g-001"
+    volID := fmt.Sprintf("%s:%d.%d.%d/%s",
+        iscsiStorageID, 0, 0, disk.ISCSI.LUN, extractLUNName(disk.ISCSI.TargetIQN))
+
+    // 3. Attach to VM as SCSI device with IOPS limits
+    opts := map[string]interface{}{
+        disk.Device: fmt.Sprintf("%s,size=%dG", volID, disk.Size),
+    }
+    if disk.IOPSLimit > 0 {
+        opts[disk.Device] += fmt.Sprintf(",iops_rd=%d,iops_wr=%d",
+            disk.IOPSLimit, disk.IOPSLimit)
+    }
+
+    // 4. POST /nodes/{node}/qemu/{vmid}/config
+    return pc.configureVM(vmid, nodeName, opts)
+}
+```
+
+**After VM creation**, kubemox records the attached disks in the `VirtualMachine` status so downstream consumers (talos-operator) can correlate SCSI bus positions with iSCSI LUNs.
+
+#### Phase 3: Talos Sees the Disk
+
+When the VM boots, the iSCSI LUNs appear as standard SCSI block devices. Talos does not know or care that the backing store is iSCSI — the hypervisor handles the iSCSI initiator session. From Talos's perspective:
+
+```
+/dev/sda  →  scsi0 (boot disk, local-lvm, 50 GiB)
+/dev/sdb  →  scsi1 (iSCSI LUN, 24 GiB)
+/dev/sdc  →  scsi2 (iSCSI LUN, 24 GiB)
+/dev/sdd  →  scsi3 (iSCSI LUN, 64 GiB)
+```
+
+Talos exposes disk metadata that the `VolumeConfig` `diskSelector` CEL expression can match:
+
+| Property | Description | Example |
+|---|---|---|
+| `disk.size` | Disk capacity | `24000000000` (bytes) |
+| `disk.transport` | Bus type | `"scsi"` |
+| `disk.busPath` | Kernel device path | `"/dev/sdb"` |
+| `disk.serial` | Disk serial number | `"lun-24g-001"` (from iSCSI target) |
+| `disk.name` | Kernel name | `"sdb"` |
+
+**Serial number** is the most reliable discriminator for iSCSI LUNs because Proxmox propagates the zvol name as the SCSI serial. This means the `diskSelector` can match specific LUNs without relying on enumeration order:
+
+```cel
+disk.transport == 'scsi' && disk.serial == 'lun-24g-001'
+```
+
+#### Phase 4: VolumeConfig Mounts the Disk
+
+The `VolumeConfig` resource (appended to the machine config as a multi-doc YAML) handles the full lifecycle:
+
+```
+1. Boot → Talos machined enumerates disks
+2. VolumeConfig.diskSelector → CEL expression evaluated against each disk
+3. Match found → Check provisioning constraints (minSize, maxSize)
+4. Disk unformatted? → Format with specified filesystem (xfs)
+5. Label filesystem → e.g., "data-shard-1"
+6. Mount at specified path → e.g., /var/data/shard-1
+7. Grow if needed → If `grow: true` and disk is larger than current FS
+```
+
+The rendered VolumeConfig for an iSCSI LUN:
+
+```yaml
+---
+apiVersion: v1alpha1
+kind: VolumeConfig
+name: data-shard-1
+provisioning:
+  diskSelector:
+    match: 'disk.transport == "scsi" && disk.serial == "lun-24g-001"'
+  grow: true
+  minSize: 24GiB
+  maxSize: 24GiB
+  fileSystems:
+    - type: xfs
+      label: data-shard-1
+mount:
+  path: /var/data/shard-1
+```
+
+#### Phase 5: Failure Modes and Mitigations
+
+| Failure | Impact | Mitigation |
+|---|---|---|
+| **iSCSI portal unreachable at boot** | VM BIOS/UEFI may stall waiting for SCSI devices. Talos boot delayed but not blocked (boot disk is local). | Proxmox retries the iSCSI initiator session. VolumeConfig mounts are non-blocking — Talos boots with the local disk and mounts data volumes when they become available. |
+| **LUN path changes** (different SCSI bus position) | `/dev/sdb` may become `/dev/sdc` after reboot. | Use `disk.serial` in diskSelector, not `disk.busPath`. Serial is stable across reboots; bus position is not. |
+| **iSCSI session timeout** (storage network flap) | Mounted filesystem goes read-only or I/O errors. | Proxmox iSCSI initiator handles reconnection. For the application layer, workloads should use retry logic. Consider `noop` scheduler for iSCSI disks. |
+| **Multipath** (multiple paths to same LUN) | Duplicate block devices visible to Talos. | Not applicable in single-portal configurations. If multipath is needed, configure it at the Proxmox level (DM-Multipath on the host), not inside the VM. The VM sees a single SCSI device regardless. |
+| **Disk serial collision** (two LUNs with same serial) | diskSelector matches multiple disks — VolumeConfig fails. | Enforce unique zvol names in the IQN naming convention. kubemox should validate serial uniqueness across all iSCSI disks attached to the same VM. |
+| **VolumeConfig format on wrong disk** | Data loss if diskSelector matches the boot disk. | Always include `disk.size` or `disk.serial` constraints. The boot disk has a different size and serial. The `Talos install disk` is excluded from VolumeConfig by default. |
+
+#### Example: Complete iSCSI Worker Node
+
+```yaml
+# --- kubemox VirtualMachine ---
+apiVersion: proxmox.alperen.cloud/v1alpha1
+kind: VirtualMachine
+metadata:
+  name: prod-worker-0
+  namespace: fleet
+spec:
+  name: prod-worker-0
+  nodeName: pve2
+  vmid: 10110
+  connectionRef:
+    name: proxmox-main
+  vmSpec:
+    cores: 8
+    memory: 16384
+    disk:
+      # Boot disk — local storage
+      - storage: local-lvm
+        size: 50
+        device: scsi0
+      # iSCSI data disks
+      - device: scsi1
+        size: 24
+        iopsLimit: 500
+        iscsi:
+          targetIQN: "iqn.2026-01.com.infra:zfs-pool-lun-24g-001"
+          portal: "10.0.2.5:3260"
+          lun: 0
+      - device: scsi2
+        size: 24
+        iopsLimit: 500
+        iscsi:
+          targetIQN: "iqn.2026-01.com.infra:zfs-pool-lun-24g-002"
+          portal: "10.0.2.5:3260"
+          lun: 0
+      - device: scsi3
+        size: 64
+        iopsLimit: 1000
+        iscsi:
+          targetIQN: "iqn.2026-01.com.infra:zfs-pool-lun-64g-001"
+          portal: "10.0.2.5:3260"
+          lun: 0
+    network:
+      - model: virtio
+        bridge: vmbr0
+    pciDevices:
+      - type: mapped
+        deviceID: "sriov-vf-pool-1"
+---
+# --- talos-operator TalosMachine ---
+apiVersion: talos.alperen.cloud/v1alpha1
+kind: TalosMachine
+metadata:
+  name: prod-worker-0
+  namespace: fleet
+spec:
+  endpoint: "10.0.1.21"
+  version: "v1.10.3"
+  workerRef:
+    name: prod-workers
+  machineSpec:
+    dataVolumes:
+      # Match by serial — stable across reboots, independent of bus enumeration
+      - name: data-shard-1
+        diskSelector: 'disk.transport == "scsi" && disk.serial == "lun-24g-001"'
+        mountPath: /var/data/shard-1
+        minSize: "24GiB"
+        maxSize: "24GiB"
+        fsType: xfs
+      - name: data-shard-2
+        diskSelector: 'disk.transport == "scsi" && disk.serial == "lun-24g-002"'
+        mountPath: /var/data/shard-2
+        minSize: "24GiB"
+        maxSize: "24GiB"
+        fsType: xfs
+      - name: data-large
+        diskSelector: 'disk.transport == "scsi" && disk.serial == "lun-64g-001"'
+        mountPath: /var/data/large
+        minSize: "64GiB"
+        maxSize: "64GiB"
+        fsType: xfs
+  networkSpec:
+    ipAddress: "10.0.1.21"
+    cidr: 24
+    gateway: "10.0.1.1"
+    macAddress: "BC:24:11:AA:BB:21"
+    nameservers:
+      - "10.0.1.1"
+```
+
+#### iSCSI Data Path Summary
+
+```
+┌─────────────┐     ┌──────────────┐     ┌─────────────────┐     ┌──────────────┐
+│ ZFS Pool     │     │ Proxmox Host │     │ VM (Talos)      │     │ Talos Init   │
+│              │     │              │     │                 │     │              │
+│ zvol/lun-001 │────▶│ iSCSI Target │────▶│ /dev/sdb (SCSI) │────▶│ VolumeConfig │
+│ (24 GiB)     │ TCP │ LIO/targetcli│ PCI │ serial: lun-001 │ CEL │ match serial │
+│              │ 3260│              │pass-│                 │     │ format xfs   │
+│              │     │ iscsi-zfs-   │thru │                 │     │ mount /var/  │
+│              │     │ pool storage │     │                 │     │ data/shard-1 │
+└─────────────┘     └──────────────┘     └─────────────────┘     └──────────────┘
+
+kubemox role:                              talos-operator role:
+  - Register iSCSI storage (if needed)       - Generate VolumeConfig YAML
+  - Attach LUN as SCSI device                - Match by disk.serial (stable)
+  - Set IOPS limits                          - Append to machine config
+  - Report disk status                       - Apply via Talos API
+```
+
 ---
 
 ## Shortcoming 3: VM ID Assignment
