@@ -226,6 +226,32 @@ talos-operator (watches kubemox status):
 
 ---
 
+## Decision Matrix
+
+| Approach | Deterministic from First Boot? | Automation Friendly? | Complexity | DHCP Required? |
+|---|---|---|---|---|
+| **NoCloud + cicustom (Opt 2A)** | Yes | Yes (Terraform/Operator) | Medium | No |
+| **NoCloud + SMBIOS serial (Opt 2B)** | Partial (initial DHCP) | Yes | Medium | Yes (initial fetch) |
+| **Static IP in machine config (Opt 1)** | No (initial DHCP for apply) | Partial | Low | Yes (initial boot) |
+| **DHCP reservations (Opt 3)** | Yes | No (router config) | Low | Yes (by design) |
+| **META partition (Opt 4)** | Yes | Partial (custom images) | High | No |
+| **Kernel `ip=` param** | First boot only, NOT persistent | No | Low | No |
+| **VIP (control plane only)** | N/A (endpoint only) | Yes | Low | Depends |
+
+### Additional Findings
+
+**QEMU Guest Agent does NOT run in maintenance mode**: Even with the `siderolabs/qemu-guest-agent` extension, the agent only starts after the machine config is applied and Talos fully boots. During maintenance mode (pre-config), Proxmox still cannot query the IP. This is a [known issue (GitHub #11651)](https://github.com/siderolabs/talos/issues/11651). This reinforces why we need the IP to be **known before boot**, not discovered after.
+
+**Network config version gotcha**: When creating the `network-config` file for nocloud/cloud-init, do NOT wrap in a top-level `network:` key. Start directly with `version: 1`. Talos will error with "network-config metadata version=0 is not supported" if the format is wrong.
+
+**Kernel `ip=` param is NOT persistent**: Setting `ip=` on the kernel command line at boot works for the initial boot only. When Talos installs to disk, the bootloader is rewritten and the `ip=` parameter is dropped. After reboot, the node falls back to DHCP unless the machine config has static settings.
+
+**Talos F3 key (manual)**: On the Proxmox console, pressing F3 in maintenance mode opens a network config dialog. Useful for debugging but not automatable.
+
+**omni-infra-provider-proxmox approach**: Sidero's own Proxmox provider for Omni supports a `subnet` field (CIDR, e.g., `192.168.1.0/24`). When set, VMs get static IPs based on their VM ID within the subnet. This is a good model to follow — deterministic IP = f(subnet, vmid).
+
+---
+
 ## Alternative: Crossplane v2 Composition for Deployment
 
 For the deployment layer, a **Crossplane v2 composition** can orchestrate the full stack:
@@ -258,3 +284,9 @@ This would sit above both operators and provide the user-facing API.
 - [Talos on Proxmox with Terraform (xoid.net)](https://xoid.net/2024/07/27/talos-terraform-proxmox.html)
 - [TechDufus: Talos Homelab with Terraform](https://techdufus.com/tech/2025/06/30/building-a-talos-kubernetes-homelab-on-proxmox-with-terraform.html)
 - [Secsys: Talos with Kubernetes on Proxmox](https://secsys.pages.dev/posts/talos/)
+- [GitHub Issue #11651 - Guest Agent in Maintenance Mode](https://github.com/siderolabs/talos/issues/11651)
+- [Talos Static Addressing Docs](https://docs.siderolabs.com/talos/v1.12/networking/configuration/static)
+- [Kubito: Static IP on Talos Node](https://kubito.dev/posts/talos-linux-node-static-ip/)
+- [Pedro Chang: How I Setup Talos Linux](https://medium.com/@pedrotychang/how-i-setup-talos-linux-bc2832ec87cc)
+- [Terraform Module: bbtechsys/talos/proxmox](https://registry.terraform.io/modules/bbtechsys/talos/proxmox/latest)
+- [rgl/terraform-proxmox-talos](https://github.com/rgl/terraform-proxmox-talos)
