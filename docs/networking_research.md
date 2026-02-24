@@ -1,12 +1,37 @@
-# Talos Linux on Proxmox: Network Configuration Research
+# Talos Linux on Proxmox: Network & Infrastructure Research
 
 > **Date**: 2026-02-24
-> **Status**: Research findings — informing design of talos-operator + kubemox networking integration
-> **Context**: We need deterministic, persistent IPs for Talos VMs on Proxmox so that talos-operator can reliably reach nodes before, during, and after Talos installation.
+> **Status**: Implementation proposal — addressing all 4 shortcomings for fleet provisioning
+> **Context**: Build a fleet of Kubernetes clusters on Proxmox hypervisors using Talos Linux VMs, managed by a supervisor cluster running kubemox + talos-operator.
 
 ---
 
-## The Core Problem
+## Requirements Summary
+
+**Fleet topology**: Control plane nodes can share a hypervisor or be distributed to dedicated hosts. Worker nodes have varying compute shapes coupled with storage.
+
+**Storage**: Multiple iSCSI attachments from Proxmox ZFS pools as pre-determined units (24GB, 32GB, 64GB) with IOPS profiles.
+
+**Networking**: SR-IOV passthrough VNFs from high-speed NICs (Proxmox resource mappings) with virtio bridge fallback. **Static IP only — no DHCP.**
+
+**Management**: Supervisor K8s cluster running kubemox + talos-operator. GitOps-friendly via Crossplane v2 compositions.
+
+---
+
+## The 4 Shortcomings
+
+| # | Shortcoming | Root Cause |
+|---|---|---|
+| 1 | Static IP assignment not declarative | Talos bootstrap overrides interface addresses; kubemox has no IP/MAC control |
+| 2 | Multi-disk attachment + mount paths | kubemox `VirtualMachineDisk` has no iSCSI support; Talos has no volume path config |
+| 3 | VM ID assignment | kubemox `CreateVMFromTemplate()` uses auto-assigned VMID from Proxmox |
+| 4 | Deterministic ordering | No dependency/ordering mechanism between VMs |
+
+---
+
+## Shortcoming 1: Static IP Assignment
+
+### The Core Problem
 
 When kubemox clones a Talos VM and boots it on Proxmox:
 
@@ -16,251 +41,1036 @@ When kubemox clones a Talos VM and boots it on Proxmox:
 4. **Post-install**: Talos brings up networking per its *own* config — may get DHCP IP `Y` (different from `X`)
 5. **Lost contact**: talos-operator can no longer reach the node at `X`
 
-Additionally, the **QEMU guest agent does not run on Talos by default** (immutable OS, no package manager), so Proxmox cannot report the VM's IP through `AgentGetNetworkIFaces()`. The kubemox status field for IP would remain empty/nil for stock Talos VMs.
+The **QEMU guest agent does not run on Talos by default** and even with the `siderolabs/qemu-guest-agent` extension from Image Factory, it does NOT run in maintenance mode ([GitHub #11651](https://github.com/siderolabs/talos/issues/11651)). So Proxmox/kubemox cannot discover the IP.
 
-**Conclusion**: Pure DHCP without reservations is not viable for this integration. We need a deterministic IP strategy.
+**Additionally**: The requestor uses SR-IOV passthrough as the primary NIC. Talos must be configured to use the passthrough interface with a static IP, with virtio bridge as fallback.
 
----
+### Solution: Two-Layer Static IP
 
-## Solution Options (Ranked)
+**Layer 1 — Talos META key** (pre-install): The talos-operator already has `ApplyMetaKey()` in `pkg/talos/client.go:185` and a network template in `pkg/talos/metakey_tpl.go`. META key 0x0a sets network config that is applied **before** machine config, giving the node a reachable IP in maintenance mode.
 
-### Option 1: Static IP in Talos Machine Config (Recommended)
+**Layer 2 — Machine config patch** (post-install): A static network block in the Talos machine config using `deviceSelector.hardwareAddr` (MAC-based) ensures the IP persists across installs and reboots.
 
-Configure the IP directly in the Talos machine configuration YAML. This is the most reliable approach because Talos owns its own networking.
+### Where to Implement
+
+#### A. kubemox — Add MAC to `VirtualMachineNetwork` and `QEMUStatus`
+
+**File**: `kubemox/api/proxmox/v1alpha1/virtualmachine_types.go:142-162`
+
+```go
+// CURRENT (line 142)
+type VirtualMachineNetwork struct {
+    Model  string `json:"model"`
+    Bridge string `json:"bridge"`
+}
+
+// PROPOSED
+type VirtualMachineNetwork struct {
+    Model  string `json:"model"`
+    Bridge string `json:"bridge"`
+    // MACAddress sets an explicit MAC. If empty, Proxmox auto-generates.
+    // +kubebuilder:validation:Optional
+    // +kubebuilder:validation:Pattern=`^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$`
+    MACAddress string `json:"macAddress,omitempty"`
+    // VLAN tag for this interface (0 = no VLAN)
+    // +kubebuilder:validation:Optional
+    VLAN int `json:"vlan,omitempty"`
+}
+```
+
+```go
+// CURRENT (line 149)
+type QEMUStatus struct {
+    State     string `json:"state"`
+    Node      string `json:"node"`
+    Uptime    string `json:"uptime"`
+    ID        int    `json:"id"`
+    IPAddress string `json:"IPAddress"`
+    OSInfo    string `json:"OSInfo"`
+}
+
+// PROPOSED — add MACAddress
+type QEMUStatus struct {
+    State      string `json:"state"`
+    Node       string `json:"node"`
+    Uptime     string `json:"uptime"`
+    ID         int    `json:"id"`
+    IPAddress  string `json:"IPAddress"`
+    OSInfo     string `json:"OSInfo"`
+    MACAddress string `json:"macAddress,omitempty"`
+}
+```
+
+**File**: `kubemox/pkg/proxmox/virtualmachine.go:111-114`
+
+When building `CloneOptions`, pass MAC if specified. After clone, read MAC from Proxmox API and populate status:
+
+```go
+// In CreateVMFromTemplate(), after clone completes:
+// Parse MAC from Proxmox VM config (net0 = "virtio=BC:24:11:AA:BB:CC,bridge=vmbr0")
+func extractMACFromVM(vm *proxmox.VirtualMachine) string {
+    // vm.VirtualMachineConfig.Net0 contains the full net string
+    // Parse out the MAC address portion
+    // ...
+}
+```
+
+**File**: `kubemox/pkg/proxmox/virtualmachine.go:607` — In `UpdateVMStatus()`, populate `MACAddress` field.
+
+#### B. talos-operator — Add `NetworkSpec` to `TalosMachineSpec`
+
+**File**: `talos-operator/api/v1alpha1/talosmachine_types.go`
+
+```go
+// PROPOSED — new types to add
+
+// NetworkSpec defines the static network identity for a Talos machine.
+type NetworkSpec struct {
+    // IPAddress is the static IP (e.g., "192.168.1.11")
+    // +kubebuilder:validation:Required
+    IPAddress string `json:"ipAddress"`
+    // CIDR prefix length (e.g., 24)
+    // +kubebuilder:default=24
+    CIDR int `json:"cidr,omitempty"`
+    // Gateway is the default gateway
+    // +kubebuilder:validation:Required
+    Gateway string `json:"gateway"`
+    // MACAddress of the target NIC. Used in deviceSelector.hardwareAddr.
+    // +kubebuilder:validation:Optional
+    MACAddress string `json:"macAddress,omitempty"`
+    // Nameservers
+    // +kubebuilder:validation:Optional
+    Nameservers []string `json:"nameservers,omitempty"`
+    // VIP is a floating IP for control plane HA
+    // +kubebuilder:validation:Optional
+    VIP string `json:"vip,omitempty"`
+    // Interface name override (default: auto-detect via MAC)
+    // +kubebuilder:validation:Optional
+    Interface string `json:"interface,omitempty"`
+}
+```
+
+Add to `TalosMachineSpec`:
+
+```go
+type TalosMachineSpec struct {
+    // ... existing fields ...
+    // NetworkSpec defines the static network config for this machine.
+    // +kubebuilder:validation:Optional
+    NetworkSpec *NetworkSpec `json:"networkSpec,omitempty"`
+}
+```
+
+#### C. talos-operator — Static Network Patch Generation
+
+**File**: `talos-operator/pkg/talos/bundle.go` — Add alongside existing patch templates:
+
+```go
+// NEW patch templates
+var (
+    // ... existing InstallDisk, InstallImage, etc. ...
+
+    // StaticNetworkPatch is appended as multi-doc YAML to the machine config.
+    // Uses deviceSelector.hardwareAddr so interface name doesn't matter.
+    StaticNetworkPatch = `
+machine:
+  network:
+    hostname: %s
+    nameservers: %s
+    interfaces:
+      - deviceSelector:
+          hardwareAddr: "%s"
+        dhcp: false
+        addresses:
+          - %s/%d
+        routes:
+          - network: 0.0.0.0/0
+            gateway: %s`
+
+    // VIPExtension appended to StaticNetworkPatch for control plane nodes
+    VIPExtension = `
+        vip:
+          ip: %s`
+)
+```
+
+**File**: `talos-operator/internal/controller/talosmachine_controller.go:431`
+
+In `metalConfigPatches()`, append the network patch:
+
+```go
+func (r *TalosMachineReconciler) metalConfigPatches(ctx context.Context,
+    tm *talosv1alpha1.TalosMachine, config *talos.BundleConfig) (*[]string, error) {
+
+    // ... existing patches (disk, image, wipe, airgap, registries) ...
+
+    // NEW: Static network config
+    if tm.Spec.NetworkSpec != nil {
+        ns := tm.Spec.NetworkSpec
+        nsYAML := "[]"
+        if len(ns.Nameservers) > 0 {
+            nsYAML = ""
+            for _, dns := range ns.Nameservers {
+                nsYAML += fmt.Sprintf("\n      - %s", dns)
+            }
+        }
+        networkPatch := fmt.Sprintf(talos.StaticNetworkPatch,
+            tm.Name, nsYAML, ns.MACAddress, ns.IPAddress, ns.CIDR, ns.Gateway)
+        if ns.VIP != "" && tm.Spec.ControlPlaneRef != nil {
+            networkPatch += fmt.Sprintf(talos.VIPExtension, ns.VIP)
+        }
+        patches = append(patches, networkPatch)
+    }
+
+    return &patches, nil
+}
+```
+
+#### D. SR-IOV Passthrough Interface Support
+
+SR-IOV VNFs appear as PCI devices in Proxmox. kubemox already has `PciDevice` with `type: mapped` support in `VirtualMachineSpecTemplate` (line 113). The passthrough NIC gets a virtual function that Talos sees as a regular network interface.
+
+For Talos, the SR-IOV interface needs a **second entry** in the machine config `interfaces` list. The `deviceSelector` can match by `busPath` (PCI address) since passthrough devices don't have a stable kernel name:
 
 ```yaml
 machine:
   network:
     interfaces:
+      # Primary: SR-IOV VNF (passthrough)
       - deviceSelector:
-          busPath: "0000:00:12.0"  # or use hardwareAddr for MAC-based selection
+          busPath: "0000:01:10.0"  # SR-IOV VF PCI address
+        dhcp: false
+        addresses:
+          - 10.0.1.11/24
+        routes:
+          - network: 0.0.0.0/0
+            gateway: 10.0.1.1
+      # Fallback: virtio bridge
+      - deviceSelector:
+          hardwareAddr: "BC:24:11:AA:BB:CC"
         dhcp: false
         addresses:
           - 192.168.1.11/24
-        routes:
-          - network: 0.0.0.0/0
-            gateway: 192.168.1.1
-        vip:
-          ip: 192.168.1.9  # optional: VIP for HA control plane
 ```
 
-**Key details**:
-- Interface name is typically `ens18` in Proxmox VMs, but can vary
-- Using `deviceSelector` with `hardwareAddr` (MAC address) is **more reliable** than specifying interface name directly
-- Must set `dhcp: false` when using static — cannot mix DHCP and static on the same /24
-- The static IP persists across reboots and reinstalls since it's in the machine config
+**Proposed extension to `NetworkSpec`**:
 
-**How it fits our operators**:
-- **kubemox**: Creates VM, sets MAC address on the NIC (deterministic), reports MAC in status
-- **talos-operator**: Takes the user-specified static IP + MAC, generates machine config with the static network block, applies via `talosctl apply-config`
+```go
+type NetworkSpec struct {
+    // ... existing fields ...
+    // Interfaces allows specifying multiple network interfaces (e.g., SR-IOV + virtio)
+    // If set, overrides the single-interface fields above.
+    // +kubebuilder:validation:Optional
+    Interfaces []InterfaceSpec `json:"interfaces,omitempty"`
+}
 
-### Option 2: Nocloud Image + Cloud-Init (For Pre-Install Networking)
-
-Use the Talos **nocloud** image (not the metal image) which supports cloud-init. Proxmox can then inject network config via cloud-init before Talos boots.
-
-**Two delivery methods**:
-
-#### A. Local Attached Storage (CIDATA volume)
-- Create a VFAT or ISO9660 filesystem with volume label `cidata` or `CIDATA`
-- Place `user-data` (Talos machine config) and `network-config` files on it
-- Talos reads these **before any network is established** — no DHCP needed at all
-- Network config uses **version 1** format:
-  ```yaml
-  version: 1
-  config:
-    - type: physical
-      name: eth0
-      mac_address: "BC:24:11:xx:xx:xx"
-      subnets:
-        - type: static
-          address: 192.168.1.11/24
-          gateway: 192.168.1.1
-  ```
-
-#### B. SMBIOS Serial (nocloud-net)
-- Set VM's SMBIOS serial to `ds=nocloud-net;s=http://config-server/configs/`
-- Talos fetches `user-data` and `network-config` from that URL after initial DHCP
-- Requires network to be up first (chicken-and-egg for non-DHCP networks)
-- Proxmox supports this via VM Options > SMBIOS Settings
-
-**Critical version caveat**:
-- Talos **1.7.x**: `nocloud` images available on GitHub releases, cloud-init works
-- Talos **1.8.0+**: Switched to `metal` images that **ignore cloud-init entirely**
-- For 1.8+, nocloud images must be obtained from [Talos Image Factory](https://factory.talos.dev/)
-- The `metal` image is what the official Proxmox guide uses — it does NOT support cloud-init
-
-**Proxmox integration**:
-```bash
-# Set custom cloud-init config
-qm set 100 --cicustom user=local:snippets/controlplane-1.yml
-# Snippet must be placed at /var/lib/vz/snippets/ manually
-# Then click "Regenerate Image" in Proxmox UI
+type InterfaceSpec struct {
+    // Name is a human-readable label (e.g., "sriov-primary", "virtio-fallback")
+    Name string `json:"name"`
+    // DeviceSelector to match the interface in Talos
+    // +kubebuilder:validation:Optional
+    MACAddress string `json:"macAddress,omitempty"`
+    // +kubebuilder:validation:Optional
+    BusPath string `json:"busPath,omitempty"`
+    // Static IP config
+    IPAddress string `json:"ipAddress"`
+    CIDR      int    `json:"cidr,omitempty"`
+    Gateway   string `json:"gateway,omitempty"`
+    // Whether this is the default route
+    // +kubebuilder:default=false
+    DefaultRoute bool `json:"defaultRoute,omitempty"`
+}
 ```
 
-### Option 3: DHCP Reservations (MAC-Based)
+### Example YAML: TalosMachine with Static Network
 
-Bind a fixed IP to the VM's MAC address in the DHCP server (router). The VM always gets the same IP without any Talos config changes.
-
-**How to get MAC addresses**:
-1. **Proxmox VM config**: `/etc/pve/qemu-server/<VMID>.conf` contains MAC for each NIC
-2. **Proxmox UI**: VM > Hardware > Network Device
-3. **Proxmox API**: `GET /nodes/{node}/qemu/{vmid}/config` returns `net0` with MAC
-4. **ARP table**: Ping the IP, then `arp -a`
-
-**Pros**:
-- No Talos config changes needed — Talos defaults to DHCP and always gets the same IP
-- Simple for small clusters
-
-**Cons**:
-- Requires external DHCP server configuration (not managed by our operators)
-- Not GitOps-friendly — the reservation lives outside the cluster manifests
-- Breaks if someone changes the DHCP server config
-
-### Option 4: META-Based Network Configuration (Advanced)
-
-Available since Talos 1.4.0 for the `metal` platform. Network config is embedded in the boot image or passed via `INSTALLER_META_BASE64` environment variable.
-
-**How it works**:
-- When creating boot assets with `imager`, pass `--meta` flag with network config
-- The config is used immediately at boot AND written to the META partition on install
-- Survives reboots and reinstalls
-
-**Useful for**:
-- Bare-metal / air-gapped environments
-- When you need networking before machine config is applied
-- When cloud-init (nocloud) is not available
-
-**Limitation**: Requires building custom boot images per-node (each with its own IP), making it less practical for dynamic provisioning.
-
----
-
-## QEMU Guest Agent: Making Proxmox Report Talos VM IPs
-
-By default, Talos does not include the QEMU guest agent. Without it:
-- Proxmox UI shows no IP for the VM
-- `AgentGetNetworkIFaces()` API call returns nothing
-- kubemox cannot populate `status.status.IPAddress`
-- Terraform cannot detect when VMs are ready
-
-**Solution**: Build a custom Talos image with `siderolabs/qemu-guest-agent` extension via [Image Factory](https://factory.talos.dev/).
-
-**Schematic YAML**:
 ```yaml
-customization:
-  systemExtensions:
-    officialExtensions:
-      - siderolabs/qemu-guest-agent
-```
-
-**Methods to build**:
-1. **Web UI**: Go to https://factory.talos.dev/, select version, tick `qemu-guest-agent`, get ISO URL
-2. **API**: POST the schematic to `https://factory.talos.dev/schematics`, get a schematic ID, use it in image URLs
-3. **Machine config**: Set install image to `factory.talos.dev/installer/<schematic-id>:v1.x.x`
-
-**Important**: The extension must be in **both** the boot ISO and the install image. If you upgrade Talos with a different OCI image, the extension is lost.
-
-After installation, verify with: `talosctl get extensions`
-
----
-
-## Recommended Architecture for Our Operators
-
-Given these findings, the recommended approach for talos-operator + kubemox integration:
-
-### Layer 1: kubemox (VM Provisioning)
-1. Use the **nocloud** Talos image (from Image Factory, with `qemu-guest-agent` extension)
-2. Set a **deterministic MAC address** on the VM NIC
-3. Inject **cloud-init** with:
-   - `user-data`: Talos machine config (from talos-operator)
-   - `network-config`: Static IP assignment (v1 format, matched to MAC)
-4. Set `ipconfig0=ip=X.X.X.X/24,gw=Y.Y.Y.Y` via Proxmox cloud-init API
-5. Report the assigned IP and MAC in kubemox VM status
-
-### Layer 2: talos-operator (Talos Lifecycle)
-1. Generate machine config with **static network interface** block matching the kubemox-assigned IP
-2. Use `deviceSelector.hardwareAddr` to bind config to the correct NIC by MAC
-3. Apply config via `talosctl apply-config` to the known static IP
-4. The IP remains stable through install, reboot, and upgrades
-
-### Layer 3: Control Plane VIP
-For HA control planes, configure a floating VIP in the machine config:
-```yaml
-machine:
-  network:
+apiVersion: talos.alperen.cloud/v1alpha1
+kind: TalosMachine
+metadata:
+  name: prod-cp-0
+  namespace: fleet
+spec:
+  endpoint: "10.0.1.11"
+  version: "v1.10.3"
+  controlPlaneRef:
+    name: prod-controlplane
+  machineSpec:
+    meta:
+      interface: ens18
+      subnet: 24
+      gateway: 10.0.1.1
+      dnsServers:
+        - 10.0.1.1
+  networkSpec:
+    ipAddress: "10.0.1.11"
+    cidr: 24
+    gateway: "10.0.1.1"
+    macAddress: "BC:24:11:AA:BB:01"
+    nameservers:
+      - "10.0.1.1"
+      - "8.8.8.8"
+    vip: "10.0.1.10"
     interfaces:
-      - deviceSelector:
-          hardwareAddr: "BC:24:11:xx:xx:xx"
-        dhcp: false
-        addresses:
-          - 192.168.1.11/24
-        routes:
-          - network: 0.0.0.0/0
-            gateway: 192.168.1.1
-        vip:
-          ip: 192.168.1.9  # shared across all control plane nodes
-```
-
-### IP Assignment Flow
-```
-User specifies in TalosCluster CR:
-  - controlPlaneIP: 192.168.1.11 (or range: 192.168.1.11-13)
-  - gateway: 192.168.1.1
-  - vip: 192.168.1.9
-
-talos-operator:
-  1. Validates IPs are available
-  2. Creates TalosMachine CRs with assigned IPs
-  3. Generates machine configs with static network blocks
-
-kubemox (watches TalosMachine):
-  1. Creates Proxmox VM with deterministic MAC
-  2. Attaches nocloud image + cloud-init with IP config
-  3. Reports VM status (IP, MAC, VMID)
-
-talos-operator (watches kubemox status):
-  1. Applies machine config to the static IP
-  2. Bootstraps etcd, waits for Talos install
-  3. Node comes back at the SAME IP after reboot
-  4. Proceeds with cluster bootstrap
+      - name: sriov-primary
+        busPath: "0000:01:10.0"
+        ipAddress: "10.0.1.11"
+        cidr: 24
+        gateway: "10.0.1.1"
+        defaultRoute: true
+      - name: virtio-fallback
+        macAddress: "BC:24:11:AA:BB:01"
+        ipAddress: "192.168.1.11"
+        cidr: 24
 ```
 
 ---
 
-## Decision Matrix
+## Shortcoming 2: Multi-Disk Attachment & Mount Paths
 
-| Approach | Deterministic from First Boot? | Automation Friendly? | Complexity | DHCP Required? |
-|---|---|---|---|---|
-| **NoCloud + cicustom (Opt 2A)** | Yes | Yes (Terraform/Operator) | Medium | No |
-| **NoCloud + SMBIOS serial (Opt 2B)** | Partial (initial DHCP) | Yes | Medium | Yes (initial fetch) |
-| **Static IP in machine config (Opt 1)** | No (initial DHCP for apply) | Partial | Low | Yes (initial boot) |
-| **DHCP reservations (Opt 3)** | Yes | No (router config) | Low | Yes (by design) |
-| **META partition (Opt 4)** | Yes | Partial (custom images) | High | No |
-| **Kernel `ip=` param** | First boot only, NOT persistent | No | Low | No |
-| **VIP (control plane only)** | N/A (endpoint only) | Yes | Low | Depends |
+### Current State
 
-### Additional Findings
+**kubemox** `VirtualMachineDisk` (`virtualmachine_types.go:132-140`):
 
-**QEMU Guest Agent does NOT run in maintenance mode**: Even with the `siderolabs/qemu-guest-agent` extension, the agent only starts after the machine config is applied and Talos fully boots. During maintenance mode (pre-config), Proxmox still cannot query the IP. This is a [known issue (GitHub #11651)](https://github.com/siderolabs/talos/issues/11651). This reinforces why we need the IP to be **known before boot**, not discovered after.
+```go
+type VirtualMachineDisk struct {
+    Storage string `json:"storage"`  // e.g., "local-lvm"
+    Size    int    `json:"size"`     // GB
+    Device  string `json:"device"`   // e.g., "scsi0"
+}
+```
 
-**Network config version gotcha**: When creating the `network-config` file for nocloud/cloud-init, do NOT wrap in a top-level `network:` key. Start directly with `version: 1`. Talos will error with "network-config metadata version=0 is not supported" if the format is wrong.
+This only supports local Proxmox storage. No iSCSI target, no IOPS limits, no multi-disk ordering.
 
-**Kernel `ip=` param is NOT persistent**: Setting `ip=` on the kernel command line at boot works for the initial boot only. When Talos installs to disk, the bootloader is rewritten and the `ip=` parameter is dropped. After reboot, the node falls back to DHCP unless the machine config has static settings.
+**Talos** has no built-in mount path concept for data disks — it only knows about the install disk (`/machine/install/disk`). For persistent storage, Talos 1.8+ supports `VolumeConfig` resources for arbitrary disk management, and the `extraMounts` field for raw bind mounts.
 
-**Talos F3 key (manual)**: On the Proxmox console, pressing F3 in maintenance mode opens a network config dialog. Useful for debugging but not automatable.
+### Proposed Changes
 
-**omni-infra-provider-proxmox approach**: Sidero's own Proxmox provider for Omni supports a `subnet` field (CIDR, e.g., `192.168.1.0/24`). When set, VMs get static IPs based on their VM ID within the subnet. This is a good model to follow — deterministic IP = f(subnet, vmid).
+#### A. kubemox — Extend `VirtualMachineDisk` for iSCSI
+
+**File**: `kubemox/api/proxmox/v1alpha1/virtualmachine_types.go:132`
+
+```go
+// CURRENT
+type VirtualMachineDisk struct {
+    Storage string `json:"storage"`
+    Size    int    `json:"size"`
+    Device  string `json:"device"`
+}
+
+// PROPOSED
+type VirtualMachineDisk struct {
+    // Storage is the Proxmox storage pool name (e.g., "local-lvm", "zfs-pool")
+    Storage string `json:"storage"`
+    // Size in GB
+    // +kubebuilder:validation:Minimum=1
+    Size int `json:"size"`
+    // Device bus name (e.g., "scsi0", "scsi1", "virtio0")
+    Device string `json:"device"`
+    // IOPSLimit sets read+write IOPS throttle (0 = unlimited)
+    // +kubebuilder:validation:Optional
+    IOPSLimit int `json:"iopsLimit,omitempty"`
+    // MBpsLimit sets read+write throughput throttle in MB/s (0 = unlimited)
+    // +kubebuilder:validation:Optional
+    MBpsLimit int `json:"mbpsLimit,omitempty"`
+    // iSCSI configures an external iSCSI target instead of local storage
+    // +kubebuilder:validation:Optional
+    ISCSI *ISCSIDisk `json:"iscsi,omitempty"`
+}
+
+// ISCSIDisk defines an iSCSI LUN attachment
+type ISCSIDisk struct {
+    // Target IQN (e.g., "iqn.2026-01.com.example:zfs-pool-lun1")
+    TargetIQN string `json:"targetIQN"`
+    // Portal address (e.g., "10.0.0.5:3260")
+    Portal string `json:"portal"`
+    // LUN number
+    // +kubebuilder:default=0
+    LUN int `json:"lun,omitempty"`
+}
+```
+
+**File**: `kubemox/pkg/proxmox/virtualmachine.go`
+
+In `CreateVMFromScratch()` (line 455), after creating the VM, apply disk configs including IOPS limits via Proxmox API:
+
+```go
+// For each disk with IOPSLimit or MBpsLimit:
+// qm set <vmid> --<device> <storage>:<size>,iops_rd=<limit>,iops_wr=<limit>
+func (pc *ProxmoxClient) applyDiskIOPS(vmName, nodeName string, disk proxmoxv1alpha1.VirtualMachineDisk) error {
+    if disk.IOPSLimit == 0 && disk.MBpsLimit == 0 {
+        return nil
+    }
+    // Build the Proxmox disk string with IOPS parameters
+    // e.g., "local-lvm:50,iops_rd=500,iops_wr=500,mbps_rd=100,mbps_wr=100"
+    opts := map[string]interface{}{
+        disk.Device: fmt.Sprintf("%s:%d,iops_rd=%d,iops_wr=%d",
+            disk.Storage, disk.Size, disk.IOPSLimit, disk.IOPSLimit),
+    }
+    return pc.configureVM(vmName, nodeName, opts)
+}
+```
+
+For iSCSI disks, Proxmox supports them via the `iscsi` storage type. The disk would be attached as:
+
+```
+scsi1: iscsi:iqn.2026-01.com.example:lun1/0,size=24G
+```
+
+#### B. talos-operator — Talos VolumeConfig for Data Disks
+
+Talos 1.8+ `VolumeConfig` allows declaring disk volumes. These get appended to the machine config as separate YAML documents (the operator already does this for ImageCache in `talosmachine_controller.go:203`).
+
+**File**: `talos-operator/pkg/talos/bundle.go` — Add volume config templates:
+
+```go
+// VolumeConfigTemplate for data disks
+// Appended as multi-doc YAML after the machine config
+var VolumeConfigTemplate = `
+---
+apiVersion: v1alpha1
+kind: VolumeConfig
+name: %s
+provisioning:
+  diskSelector:
+    match: '%s'
+  grow: true
+  minSize: %s
+  maxSize: %s
+  fileSystems:
+    - type: xfs
+      label: %s
+mount:
+  path: %s
+`
+```
+
+**File**: `talos-operator/api/v1alpha1/talosmachine_types.go` — Add to MachineSpec:
+
+```go
+// PROPOSED addition to MachineSpec
+type MachineSpec struct {
+    // ... existing fields (InstallDisk, Image, AirGap, etc.) ...
+
+    // DataVolumes defines additional disk volumes to configure in Talos.
+    // Each volume maps a disk to a mount path with optional size constraints.
+    // +kubebuilder:validation:Optional
+    DataVolumes []DataVolume `json:"dataVolumes,omitempty"`
+}
+
+type DataVolume struct {
+    // Name of the volume (e.g., "data-24g-1")
+    Name string `json:"name"`
+    // DiskSelector is a CEL expression to match the disk in Talos
+    // (e.g., "disk.size > 20u * GB && disk.size < 30u * GB")
+    DiskSelector string `json:"diskSelector"`
+    // MountPath where this volume is mounted (e.g., "/var/data/shard-1")
+    MountPath string `json:"mountPath"`
+    // MinSize (e.g., "24GiB")
+    // +kubebuilder:validation:Optional
+    MinSize string `json:"minSize,omitempty"`
+    // MaxSize (e.g., "24GiB")
+    // +kubebuilder:validation:Optional
+    MaxSize string `json:"maxSize,omitempty"`
+    // Filesystem type (default: xfs)
+    // +kubebuilder:default="xfs"
+    FSType string `json:"fsType,omitempty"`
+}
+```
+
+In the controller, volume configs are generated and appended to the machine config bytes (same pattern as `ImageCacheVolumeConfig`):
+
+```go
+// In handleControlPlaneMachine() or handleWorkerMachine():
+if tm.Spec.MachineSpec != nil && len(tm.Spec.MachineSpec.DataVolumes) > 0 {
+    for _, vol := range tm.Spec.MachineSpec.DataVolumes {
+        volConfig := fmt.Sprintf(talos.VolumeConfigTemplate,
+            vol.Name, vol.DiskSelector, vol.MinSize, vol.MaxSize, vol.Name, vol.MountPath)
+        *cpConfig = append(*cpConfig, []byte(volConfig)...)
+    }
+}
+```
+
+### Example YAML: Multi-Disk Worker Node
+
+```yaml
+apiVersion: proxmox.alperen.cloud/v1alpha1
+kind: VirtualMachine
+metadata:
+  name: prod-worker-0
+spec:
+  name: prod-worker-0
+  nodeName: pve2
+  connectionRef:
+    name: proxmox-main
+  vmSpec:
+    cores: 8
+    memory: 16384
+    disk:
+      - storage: local-lvm
+        size: 50
+        device: scsi0                # Boot disk
+      - storage: zfs-pool
+        size: 24
+        device: scsi1                # Data shard 1
+        iopsLimit: 500
+      - storage: zfs-pool
+        size: 24
+        device: scsi2                # Data shard 2
+        iopsLimit: 500
+      - storage: zfs-pool
+        size: 64
+        device: scsi3                # Large data volume
+        iopsLimit: 1000
+    network:
+      - model: virtio
+        bridge: vmbr0
+    pciDevices:
+      - type: mapped
+        deviceID: "sriov-vf-pool-1"  # SR-IOV VF resource mapping
+---
+apiVersion: talos.alperen.cloud/v1alpha1
+kind: TalosMachine
+metadata:
+  name: prod-worker-0
+spec:
+  endpoint: "10.0.1.21"
+  version: "v1.10.3"
+  workerRef:
+    name: prod-workers
+  machineSpec:
+    dataVolumes:
+      - name: data-shard-1
+        diskSelector: "disk.transport == 'scsi' && disk.size > 20u * GB && disk.size < 30u * GB"
+        mountPath: /var/data/shard-1
+        minSize: "24GiB"
+        maxSize: "24GiB"
+      - name: data-shard-2
+        diskSelector: "disk.transport == 'scsi' && disk.busPath == '/dev/sdc'"
+        mountPath: /var/data/shard-2
+        minSize: "24GiB"
+        maxSize: "24GiB"
+      - name: data-large
+        diskSelector: "disk.size > 60u * GB"
+        mountPath: /var/data/large
+        minSize: "64GiB"
+        maxSize: "64GiB"
+        fsType: xfs
+  networkSpec:
+    ipAddress: "10.0.1.21"
+    cidr: 24
+    gateway: "10.0.1.1"
+```
 
 ---
 
-## Alternative: Crossplane v2 Composition for Deployment
+## Shortcoming 3: VM ID Assignment
 
-For the deployment layer, a **Crossplane v2 composition** can orchestrate the full stack:
-- Compose kubemox `VirtualMachine` resources + talos-operator `TalosCluster` resources
-- Handle IP allocation via a Crossplane function (e.g., IPAM provider)
-- GitOps-friendly: entire cluster defined as a single Crossplane Claim
-- Enables self-service Kubernetes cluster provisioning
+### Current State
 
-This would sit above both operators and provide the user-facing API.
+**File**: `kubemox/pkg/proxmox/virtualmachine.go:111-124`
+
+```go
+var CloneOptions proxmox.VirtualMachineCloneOptions
+CloneOptions.Full = 1
+CloneOptions.Name = vm.Name
+CloneOptions.Target = nodeName
+// No VMID set — Proxmox auto-assigns next available
+newID, task, err := templateVM.Clone(ctx, &CloneOptions)
+```
+
+The `go-proxmox` library's `VirtualMachineCloneOptions` does NOT have a VMID field. kubemox uses a fork: `github.com/alperencelik/go-proxmox v0.0.0-20260201203053-5a1bc2aed607`.
+
+The Proxmox API itself supports `newid` parameter in `POST /nodes/{node}/qemu/{vmid}/clone`. The `go-proxmox` `CloneOptions` struct needs to be extended (or the fork patched).
+
+### Proposed Changes
+
+#### A. go-proxmox fork — Add VMID to CloneOptions
+
+**File**: `go-proxmox/types.go` (in the fork `alperencelik/go-proxmox`)
+
+```go
+// CURRENT
+type VirtualMachineCloneOptions struct {
+    Full    int    `json:"full"`
+    Name    string `json:"name"`
+    Target  string `json:"target"`
+    // ...
+}
+
+// PROPOSED — add NewID
+type VirtualMachineCloneOptions struct {
+    Full    int    `json:"full"`
+    Name    string `json:"name"`
+    Target  string `json:"target"`
+    NewID   int    `json:"newid,omitempty"`  // If 0, Proxmox auto-assigns
+    // ...
+}
+```
+
+#### B. kubemox — Add VMID to VirtualMachineSpec
+
+**File**: `kubemox/api/proxmox/v1alpha1/virtualmachine_types.go`
+
+```go
+type VirtualMachineSpec struct {
+    Name               string                        `json:"name"`
+    NodeName           string                        `json:"nodeName"`
+    Template           *VirtualMachineSpecTemplate   `json:"template,omitempty"`
+    VMSpec             *NewVMSpec                    `json:"vmSpec,omitempty"`
+    DeletionProtection bool                          `json:"deletionProtection,omitempty"`
+    EnableAutoStart    bool                          `json:"enableAutoStart,omitempty"`
+    AdditionalConfig   map[string]string             `json:"additionalConfig,omitempty"`
+    ConnectionRef      *corev1.LocalObjectReference  `json:"connectionRef,omitempty"`
+    // NEW: VMID allows specifying a deterministic Proxmox VM ID.
+    // If 0, Proxmox auto-assigns the next available ID.
+    // +kubebuilder:validation:Optional
+    // +kubebuilder:validation:Minimum=100
+    // +kubebuilder:validation:Maximum=999999999
+    VMID int `json:"vmid,omitempty"`
+}
+```
+
+**File**: `kubemox/pkg/proxmox/virtualmachine.go:111`
+
+```go
+// In CreateVMFromTemplate():
+var CloneOptions proxmox.VirtualMachineCloneOptions
+CloneOptions.Full = 1
+CloneOptions.Name = vm.Name
+CloneOptions.Target = nodeName
+if vm.Spec.VMID > 0 {
+    CloneOptions.NewID = vm.Spec.VMID  // Use specified VMID
+}
+```
+
+### Example YAML
+
+```yaml
+apiVersion: proxmox.alperen.cloud/v1alpha1
+kind: VirtualMachine
+metadata:
+  name: prod-cp-0
+spec:
+  name: prod-cp-0
+  nodeName: pve1
+  vmid: 10110          # Deterministic: cluster 101, node 10
+  connectionRef:
+    name: proxmox-main
+  template:
+    name: talos-v1.10-nocloud
+    cores: 4
+    memory: 8192
+```
+
+**VMID naming convention suggestion**: `<cluster-id><node-index>` — e.g., cluster 101 gets VMIDs 10100-10199. This makes VMIDs predictable and traceable.
+
+---
+
+## Shortcoming 4: Deterministic Ordering
+
+### Current State
+
+kubemox reconciles `VirtualMachine` CRs independently with no ordering guarantees. The controller uses `MaxConcurrentReconciles: 30` (`virtualmachine_controller.go:51`). VMs are created in whatever order the workqueue processes them.
+
+### Why Ordering Matters
+
+For Talos clusters:
+1. **First control plane node** must exist and have its config applied before `talosctl bootstrap` can run
+2. Additional control plane nodes join the existing etcd cluster
+3. Workers join after the control plane is bootstrapped
+
+However, **VM creation order is less critical than Talos bootstrap order**. kubemox can create all VMs in parallel — the ordering that matters is handled by talos-operator's reconciliation logic (it already waits for machine readiness before bootstrap).
+
+### Proposed: Ordering via VMID Ranges + talos-operator Phases
+
+With VMID assignment (Shortcoming 3), ordering becomes implicit:
+- CP nodes get VMIDs 10100-10102 → talos-operator creates TalosMachine CRs in order
+- Workers get VMIDs 10110-10112 → only created after CP is bootstrapped
+
+**File**: `talos-operator/api/v1alpha1/taloscontrolplane_types.go:93`
+
+```go
+// CURRENT
+type MetalSpec struct {
+    Machines    []string     `json:"machines,omitempty"`
+    MachineSpec *MachineSpec `json:"machineSpec,omitempty"`
+}
+
+// PROPOSED — add NetworkAllocation for deterministic IP + VMID assignment
+type MetalSpec struct {
+    Machines    []string     `json:"machines,omitempty"`
+    MachineSpec *MachineSpec `json:"machineSpec,omitempty"`
+    // NetworkAllocation defines how IPs and VMIDs are assigned to machines.
+    // +kubebuilder:validation:Optional
+    NetworkAllocation *NetworkAllocation `json:"networkAllocation,omitempty"`
+}
+
+type NetworkAllocation struct {
+    // Subnet in CIDR notation (e.g., "10.0.1.0/24")
+    Subnet string `json:"subnet"`
+    // Gateway for all machines
+    Gateway string `json:"gateway"`
+    // StartIP is the first IP to allocate. Subsequent machines get +1.
+    StartIP string `json:"startIP"`
+    // StartVMID is the first Proxmox VMID. Subsequent machines get +1.
+    // +kubebuilder:validation:Optional
+    StartVMID int `json:"startVMID,omitempty"`
+    // Nameservers
+    Nameservers []string `json:"nameservers,omitempty"`
+    // VIP for control plane HA
+    VIP string `json:"vip,omitempty"`
+}
+```
+
+The TalosControlPlane controller assigns IPs and VMIDs sequentially:
+
+```go
+func (r *TalosControlPlaneReconciler) allocateForMachine(
+    alloc *NetworkAllocation, index int,
+) (ip string, vmid int) {
+    ip = incrementIP(net.ParseIP(alloc.StartIP), index).String()
+    vmid = 0
+    if alloc.StartVMID > 0 {
+        vmid = alloc.StartVMID + index
+    }
+    return
+}
+```
+
+---
+
+## Crossplane v2 Composition: GitOps Orchestration
+
+A Crossplane v2 composition provides the user-facing API — a single `TalosKubernetesCluster` Claim that generates all the underlying resources with deterministic IPs, VMIDs, and disk configs.
+
+### The Claim (What Users Write)
+
+```yaml
+apiVersion: infrastructure.example.com/v1alpha1
+kind: TalosKubernetesCluster
+metadata:
+  name: prod-cluster
+spec:
+  # Cluster identity
+  clusterID: 101
+
+  # Control plane
+  controlPlane:
+    replicas: 3
+    shape:
+      cores: 4
+      memory: 8192
+      bootDiskGB: 50
+    placement:
+      # Can be "shared" (same hypervisor as workers) or "dedicated" (dedicated hosts)
+      mode: dedicated
+      nodeNames:
+        - pve-cp-1
+        - pve-cp-2
+        - pve-cp-3
+
+  # Workers
+  workers:
+    replicas: 3
+    shape:
+      cores: 8
+      memory: 16384
+      bootDiskGB: 50
+      dataDisks:
+        - size: 24
+          iopsLimit: 500
+          mountPath: /var/data/shard-1
+        - size: 24
+          iopsLimit: 500
+          mountPath: /var/data/shard-2
+        - size: 64
+          iopsLimit: 1000
+          mountPath: /var/data/large
+    placement:
+      mode: shared
+      nodeNames:
+        - pve-worker-1
+        - pve-worker-2
+
+  # Networking — single source of truth
+  network:
+    controlPlane:
+      subnet: "10.0.1.0/24"
+      gateway: "10.0.1.1"
+      startIP: "10.0.1.11"
+      vip: "10.0.1.10"
+    workers:
+      subnet: "10.0.1.0/24"
+      gateway: "10.0.1.1"
+      startIP: "10.0.1.21"
+    nameservers:
+      - "10.0.1.1"
+      - "8.8.8.8"
+    # SR-IOV primary NIC (mapped PCI device)
+    sriovResourceMapping: "sriov-vf-pool-1"
+
+  # Proxmox
+  proxmox:
+    connectionRef:
+      name: proxmox-main
+    templateName: talos-v1.10-nocloud
+    storage:
+      bootDisk: local-lvm
+      dataDisk: zfs-pool
+
+  # Talos
+  talos:
+    version: "v1.10.3"
+    kubeVersion: "v1.33.1"
+
+  # VMID range: 10100-10199
+  vmidBase: 10100
+```
+
+### What the Composition Generates
+
+From the above Claim, the Crossplane composition pipeline produces:
+
+```
+TalosKubernetesCluster (Claim)
+├── VirtualMachine: prod-cluster-cp-0    (vmid: 10100, node: pve-cp-1, ip: 10.0.1.11)
+├── VirtualMachine: prod-cluster-cp-1    (vmid: 10101, node: pve-cp-2, ip: 10.0.1.12)
+├── VirtualMachine: prod-cluster-cp-2    (vmid: 10102, node: pve-cp-3, ip: 10.0.1.13)
+├── VirtualMachine: prod-cluster-wk-0    (vmid: 10110, node: pve-worker-1, ip: 10.0.1.21, 3 data disks)
+├── VirtualMachine: prod-cluster-wk-1    (vmid: 10111, node: pve-worker-2, ip: 10.0.1.22, 3 data disks)
+├── VirtualMachine: prod-cluster-wk-2    (vmid: 10112, node: pve-worker-1, ip: 10.0.1.23, 3 data disks)
+├── TalosControlPlane: prod-cluster-cp   (endpoint: https://10.0.1.10:6443, vip: 10.0.1.10)
+├── TalosWorker: prod-cluster-workers    (controlPlaneRef: prod-cluster-cp)
+├── TalosMachine: prod-cluster-cp-0      (ip: 10.0.1.11, networkSpec, no dataVolumes)
+├── TalosMachine: prod-cluster-cp-1      (ip: 10.0.1.12, networkSpec, no dataVolumes)
+├── TalosMachine: prod-cluster-cp-2      (ip: 10.0.1.13, networkSpec, no dataVolumes)
+├── TalosMachine: prod-cluster-wk-0      (ip: 10.0.1.21, networkSpec, 3 dataVolumes)
+├── TalosMachine: prod-cluster-wk-1      (ip: 10.0.1.22, networkSpec, 3 dataVolumes)
+└── TalosMachine: prod-cluster-wk-2      (ip: 10.0.1.23, networkSpec, 3 dataVolumes)
+```
+
+### Composition Pipeline (Sketch)
+
+```yaml
+apiVersion: apiextensions.crossplane.io/v2
+kind: Composition
+metadata:
+  name: talos-kubernetes-cluster
+spec:
+  compositeTypeRef:
+    apiVersion: infrastructure.example.com/v1alpha1
+    kind: XTalosKubernetesCluster
+
+  pipeline:
+    # Step 1: Generate control plane VMs
+    - step: control-plane-vms
+      functionRef:
+        name: function-go-templating
+      input:
+        apiVersion: gotemplating.fn.crossplane.io/v1beta1
+        kind: GoTemplate
+        source: Inline
+        inline:
+          template: |
+            {{- $s := .observed.composite.resource.spec }}
+            {{- range $i := until (int $s.controlPlane.replicas) }}
+            ---
+            apiVersion: proxmox.alperen.cloud/v1alpha1
+            kind: VirtualMachine
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: cp-vm-{{ $i }}
+            spec:
+              name: "{{ $s.metadata.name }}-cp-{{ $i }}"
+              nodeName: {{ index $s.controlPlane.placement.nodeNames $i }}
+              vmid: {{ add $s.vmidBase $i }}
+              connectionRef:
+                name: {{ $s.proxmox.connectionRef.name }}
+              template:
+                name: {{ $s.proxmox.templateName }}
+                cores: {{ $s.controlPlane.shape.cores }}
+                memory: {{ $s.controlPlane.shape.memory }}
+                disk:
+                  - storage: {{ $s.proxmox.storage.bootDisk }}
+                    size: {{ $s.controlPlane.shape.bootDiskGB }}
+                    device: scsi0
+                network:
+                  - model: virtio
+                    bridge: vmbr0
+                pciDevices:
+                  {{- if $s.network.sriovResourceMapping }}
+                  - type: mapped
+                    deviceID: {{ $s.network.sriovResourceMapping }}
+                  {{- end }}
+            {{ end }}
+
+    # Step 2: Generate worker VMs with data disks
+    - step: worker-vms
+      functionRef:
+        name: function-go-templating
+      input:
+        apiVersion: gotemplating.fn.crossplane.io/v1beta1
+        kind: GoTemplate
+        source: Inline
+        inline:
+          template: |
+            {{- $s := .observed.composite.resource.spec }}
+            {{- $nodeCount := len $s.workers.placement.nodeNames }}
+            {{- range $i := until (int $s.workers.replicas) }}
+            ---
+            apiVersion: proxmox.alperen.cloud/v1alpha1
+            kind: VirtualMachine
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: wk-vm-{{ $i }}
+            spec:
+              name: "{{ $s.metadata.name }}-wk-{{ $i }}"
+              nodeName: {{ index $s.workers.placement.nodeNames (mod $i $nodeCount) }}
+              vmid: {{ add $s.vmidBase 10 $i }}
+              connectionRef:
+                name: {{ $s.proxmox.connectionRef.name }}
+              vmSpec:
+                cores: {{ $s.workers.shape.cores }}
+                memory: {{ $s.workers.shape.memory }}
+                disk:
+                  - storage: {{ $s.proxmox.storage.bootDisk }}
+                    size: {{ $s.workers.shape.bootDiskGB }}
+                    device: scsi0
+                  {{- range $d, $disk := $s.workers.shape.dataDisks }}
+                  - storage: {{ $s.proxmox.storage.dataDisk }}
+                    size: {{ $disk.size }}
+                    device: "scsi{{ add $d 1 }}"
+                    iopsLimit: {{ $disk.iopsLimit }}
+                  {{- end }}
+                network:
+                  - model: virtio
+                    bridge: vmbr0
+                pciDevices:
+                  {{- if $s.network.sriovResourceMapping }}
+                  - type: mapped
+                    deviceID: {{ $s.network.sriovResourceMapping }}
+                  {{- end }}
+            {{ end }}
+
+    # Step 3: TalosControlPlane
+    - step: talos-control-plane
+      functionRef:
+        name: function-go-templating
+      input:
+        apiVersion: gotemplating.fn.crossplane.io/v1beta1
+        kind: GoTemplate
+        source: Inline
+        inline:
+          template: |
+            {{- $s := .observed.composite.resource.spec }}
+            ---
+            apiVersion: talos.alperen.cloud/v1alpha1
+            kind: TalosControlPlane
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: talos-cp
+            spec:
+              version: {{ $s.talos.version }}
+              kubeVersion: {{ $s.talos.kubeVersion }}
+              mode: metal
+              replicas: {{ $s.controlPlane.replicas }}
+              endpoint: "https://{{ $s.network.controlPlane.vip }}:6443"
+              metalSpec:
+                machines:
+                  {{- range $i := until (int $s.controlPlane.replicas) }}
+                  - "{{ incrementIP $s.network.controlPlane.startIP $i }}"
+                  {{- end }}
+                networkAllocation:
+                  subnet: {{ $s.network.controlPlane.subnet }}
+                  gateway: {{ $s.network.controlPlane.gateway }}
+                  startIP: {{ $s.network.controlPlane.startIP }}
+                  startVMID: {{ $s.vmidBase }}
+                  vip: {{ $s.network.controlPlane.vip }}
+                  nameservers: {{ toYaml $s.network.nameservers | nindent 20 }}
+
+    # Step 4: TalosMachines (generated by talos-operator from TalosControlPlane)
+    # Not in composition — talos-operator creates these automatically
+```
+
+### End-to-End Flow
+
+```
+1. User pushes TalosKubernetesCluster Claim to Git
+   |
+2. ArgoCD/Flux syncs to supervisor cluster
+   |
+3. Crossplane composition resolves:
+   ├── 3 CP VirtualMachine CRs (vmid: 10100-10102)
+   ├── 3 Worker VirtualMachine CRs (vmid: 10110-10112, with data disks + IOPS)
+   ├── 1 TalosControlPlane CR (with networkAllocation)
+   └── 1 TalosWorker CR
+   |
+4. kubemox reconciles VirtualMachine CRs:
+   ├── Clones template with specified VMID
+   ├── Configures disks with IOPS limits
+   ├── Attaches SR-IOV VF via PCI passthrough
+   ├── Reports MAC address in status
+   └── Starts VMs
+   |
+5. talos-operator reconciles TalosControlPlane:
+   ├── Sees networkAllocation: startIP=10.0.1.11, startVMID=10100
+   ├── Creates TalosMachine CRs:
+   │   ├── cp-0: endpoint=10.0.1.11, networkSpec={ip, mac, vip}
+   │   ├── cp-1: endpoint=10.0.1.12, networkSpec={ip, mac, vip}
+   │   └── cp-2: endpoint=10.0.1.13, networkSpec={ip, mac, vip}
+   └── (MAC addresses come from kubemox VM status)
+   |
+6. talos-operator reconciles each TalosMachine:
+   ├── Apply META key (pre-install network via metakey_tpl.go)
+   ├── Generate machine config with:
+   │   ├── Static network patch (deviceSelector.hardwareAddr)
+   │   ├── VolumeConfig for data disks
+   │   └── VIP for control plane
+   ├── Apply config via Talos API
+   ├── Talos installs → reboots at SAME IP
+   └── Bootstrap etcd on first CP node
+   |
+7. Cluster ready at VIP 10.0.1.10:6443
+```
+
+---
+
+## Summary of Changes by Project
+
+### kubemox (5 changes)
+
+| Change | File | Description |
+|---|---|---|
+| Add `MACAddress` to `VirtualMachineNetwork` | `api/proxmox/v1alpha1/virtualmachine_types.go` | Allow setting/reading MAC |
+| Add `MACAddress` to `QEMUStatus` | Same file | Report MAC in status |
+| Add `VMID` to `VirtualMachineSpec` | Same file | Deterministic VM IDs |
+| Add `IOPSLimit`, `MBpsLimit`, `ISCSI` to `VirtualMachineDisk` | Same file | iSCSI + IOPS support |
+| Pass VMID in `CloneOptions`, read MAC after clone | `pkg/proxmox/virtualmachine.go` | Wire up new fields |
+
+### go-proxmox fork (1 change)
+
+| Change | File | Description |
+|---|---|---|
+| Add `NewID` to `VirtualMachineCloneOptions` | `types.go` | Support `newid` in clone API |
+
+### talos-operator (5 changes)
+
+| Change | File | Description |
+|---|---|---|
+| Add `NetworkSpec` to `TalosMachineSpec` | `api/v1alpha1/talosmachine_types.go` | Static IP + SR-IOV config |
+| Add `DataVolume` to `MachineSpec` | Same file | Multi-disk mount paths |
+| Add `NetworkAllocation` to `MetalSpec` | `api/v1alpha1/taloscontrolplane_types.go` | Deterministic IP + VMID allocation |
+| Static network patch generation | `pkg/talos/bundle.go` | New patch templates |
+| Apply network + volume patches | `internal/controller/talosmachine_controller.go` | Wire into reconcile loop |
+
+### Crossplane (new)
+
+| Change | Description |
+|---|---|
+| XRD: `XTalosKubernetesCluster` | Composite resource definition |
+| Composition pipeline | go-templating steps for VMs, TalosCP, TalosWorker |
+| Claim: `TalosKubernetesCluster` | User-facing API |
 
 ---
 
@@ -270,23 +1080,12 @@ This would sit above both operators and provide the user-facing API.
 - [Talos Metal Network Configuration](https://www.talos.dev/v1.10/advanced/metal-network-configuration/)
 - [Talos Nocloud Documentation](https://docs.siderolabs.com/talos/v1.8/platform-specific-installations/cloud-platforms/nocloud)
 - [Talos Image Factory](https://factory.talos.dev/)
-- [JYSK Tech: 3000+ Clusters with NoCloud](https://jysk.tech/3000-clusters-part-3-how-to-boot-talos-linux-nodes-with-cloud-init-and-nocloud-acdce36f60c0)
-- [kubebn/talos-proxmox-kaas](https://github.com/kubebn/talos-proxmox-kaas)
-- [siderolabs/omni-infra-provider-proxmox](https://github.com/siderolabs/omni-infra-provider-proxmox)
-- [Cluster API + Talos + Proxmox](https://a-cup-of.coffee/blog/talos-capi-proxmox/)
-- [GitHub Discussion #9291 - Configuring Talos in Proxmox](https://github.com/siderolabs/talos/discussions/9291)
-- [GitHub Discussion #9446 - Static IP for Control Plane](https://github.com/siderolabs/talos/discussions/9446)
-- [GitHub Discussion #8509 - Getting MAC Address](https://github.com/siderolabs/talos/discussions/8509)
-- [GitHub Discussion #6970 - Automated Install on Proxmox](https://github.com/siderolabs/talos/discussions/6970)
-- [GitHub Discussion #11175 - Talos 1.10 and cloud-init](https://github.com/siderolabs/talos/discussions/11175)
-- [DEV Community: Fortress Kubernetes Cluster](https://dev.to/jorisvilardell/building-a-fortress-kubernetes-cluster-talos-linux-proxmox-and-network-isolation-1p4g)
-- [Talos on Proxmox with Terraform (Stonegarden)](https://blog.stonegarden.dev/articles/2024/08/talos-proxmox-tofu/)
-- [Talos on Proxmox with Terraform (xoid.net)](https://xoid.net/2024/07/27/talos-terraform-proxmox.html)
-- [TechDufus: Talos Homelab with Terraform](https://techdufus.com/tech/2025/06/30/building-a-talos-kubernetes-homelab-on-proxmox-with-terraform.html)
-- [Secsys: Talos with Kubernetes on Proxmox](https://secsys.pages.dev/posts/talos/)
-- [GitHub Issue #11651 - Guest Agent in Maintenance Mode](https://github.com/siderolabs/talos/issues/11651)
 - [Talos Static Addressing Docs](https://docs.siderolabs.com/talos/v1.12/networking/configuration/static)
-- [Kubito: Static IP on Talos Node](https://kubito.dev/posts/talos-linux-node-static-ip/)
-- [Pedro Chang: How I Setup Talos Linux](https://medium.com/@pedrotychang/how-i-setup-talos-linux-bc2832ec87cc)
-- [Terraform Module: bbtechsys/talos/proxmox](https://registry.terraform.io/modules/bbtechsys/talos/proxmox/latest)
-- [rgl/terraform-proxmox-talos](https://github.com/rgl/terraform-proxmox-talos)
+- [JYSK Tech: 3000+ Clusters with NoCloud](https://jysk.tech/3000-clusters-part-3-how-to-boot-talos-linux-nodes-with-cloud-init-and-nocloud-acdce36f60c0)
+- [siderolabs/omni-infra-provider-proxmox](https://github.com/siderolabs/omni-infra-provider-proxmox)
+- [pfSense REST API](https://github.com/jaredhendrickson13/pfsense-api)
+- [pfSense Go Client](https://github.com/sjafferali/pfsense-api-goclient)
+- [GitHub Issue #11651 - Guest Agent in Maintenance Mode](https://github.com/siderolabs/talos/issues/11651)
+- [Proxmox VM Cloning and MAC Behavior](https://forum.proxmox.com/threads/when-cloning-a-kvm-vm-the-mac-address-is-renewed.28153/)
+- [Proxmox iSCSI Storage](https://pve.proxmox.com/wiki/Storage:_iSCSI)
+- [Proxmox SR-IOV Resource Mappings](https://pve.proxmox.com/wiki/PCI_Passthrough)
