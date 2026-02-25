@@ -1487,7 +1487,7 @@ On `TalosMachine` deletion: Kubernetes garbage collection deletes `TalosIPAddres
 
 ### Allocation Algorithm
 
-Algorithm modeled after CAPI IPAM's `InClusterIPPool` controller (~320 lines of Go, implemented natively in talos-operator). Sequential scan, lowest-first, using `netipx.IPSet`:
+Algorithm modeled after CAPI IPAM's `InClusterIPPool` controller (~320 lines of core logic including CRD types in the CAPI reference implementation; see estimated scope table for our breakdown). Implemented natively in talos-operator. Sequential scan, lowest-first, using `netipx.IPSet`:
 
 ```go
 import "go4.org/netipx"
@@ -1700,10 +1700,10 @@ The composition pipeline generates `TalosMachine` CRs with `poolRef` set. The IP
 | `TalosIPPool` CRD types | ~60 | Spec, Status, webhook types |
 | `TalosIPAddress` CRD types | ~30 | Spec only (no status needed) |
 | `NetworkSpec` modification | ~15 | Add `PoolRef`, CEL validation |
-| IPAM controller | ~320 | Allocation, deallocation, pool status, webhook dispatch |
+| IPAM controller | ~230 | Allocation, deallocation, pool status, index setup (CRD types counted separately above) |
 | Webhook engine | ~150 | Template rendering, HTTP dispatch, retry, credential loading |
 | Tests | ~200 | Unit tests for `FindFreeAddress`, webhook dispatch, reconciliation |
-| **Total** | **~775** | Pure Go, single external dependency (`go4.org/netipx`) |
+| **Total** | **~685** | Pure Go, single external dependency (`go4.org/netipx`) |
 
 ---
 
