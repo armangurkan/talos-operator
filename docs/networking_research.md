@@ -125,16 +125,22 @@ func extractMACFromVM(vm *proxmox.VirtualMachine) string {
 // PROPOSED — new types to add
 
 // NetworkSpec defines the static network identity for a Talos machine.
+// Exactly one of IPAddress or PoolRef must be set.
 type NetworkSpec struct {
-    // IPAddress is the static IP (e.g., "192.168.1.11")
-    // +kubebuilder:validation:Required
-    IPAddress string `json:"ipAddress"`
-    // CIDR prefix length (e.g., 24)
+    // IPAddress is an explicit static IP (e.g., "192.168.1.11").
+    // Mutually exclusive with PoolRef.
+    // +kubebuilder:validation:Optional
+    IPAddress string `json:"ipAddress,omitempty"`
+    // PoolRef references a TalosIPPool for automatic IP allocation.
+    // Mutually exclusive with IPAddress.
+    // +kubebuilder:validation:Optional
+    PoolRef *PoolRef `json:"poolRef,omitempty"`
+    // CIDR prefix length (e.g., 24). Overridden by pool prefix if PoolRef is set.
     // +kubebuilder:default=24
     CIDR int `json:"cidr,omitempty"`
-    // Gateway is the default gateway
-    // +kubebuilder:validation:Required
-    Gateway string `json:"gateway"`
+    // Gateway is the default gateway. Overridden by pool gateway if PoolRef is set.
+    // +kubebuilder:validation:Optional
+    Gateway string `json:"gateway,omitempty"`
     // MACAddress of the target NIC. Used in deviceSelector.hardwareAddr.
     // +kubebuilder:validation:Optional
     MACAddress string `json:"macAddress,omitempty"`
@@ -148,6 +154,16 @@ type NetworkSpec struct {
     // +kubebuilder:validation:Optional
     Interface string `json:"interface,omitempty"`
 }
+
+// PoolRef references a TalosIPPool for automatic allocation.
+type PoolRef struct {
+    // Name of the TalosIPPool in the same namespace.
+    // +kubebuilder:validation:Required
+    Name string `json:"name"`
+}
+
+// +kubebuilder:validation:XValidation:rule="has(self.ipAddress) || has(self.poolRef)",message="one of ipAddress or poolRef must be set"
+// +kubebuilder:validation:XValidation:rule="!(has(self.ipAddress) && has(self.poolRef))",message="ipAddress and poolRef are mutually exclusive"
 ```
 
 Add to `TalosMachineSpec`:
@@ -947,28 +963,23 @@ With VMID assignment (Shortcoming 3), ordering becomes implicit:
 
 **Note on Proxmox VMIDs**: Proxmox VM IDs are **integers only**, in the range **100 to 999,999,999**. No string-based, UUID-based, or zero-prefixed identifiers are supported. The `VMID` field in kubemox enforces this with kubebuilder validation markers (`Minimum=100`, `Maximum=999999999`).
 
-#### Design Decision: IPAM Is Not the Operator's Responsibility
+#### Design Decision: IPAM Built Into talos-operator
 
-**Static IP assignment means 1:1 explicit assignment** — each `TalosMachine` declares its own IP address, gateway, and MAC. The talos-operator does **not** allocate IPs from a pool, increment from a start address, or perform any IPAM function.
+The `NetworkSpec` supports two modes of IP assignment:
 
-IPAM (IP Address Management) is a separate concern that belongs to one of these external systems:
-
-| IPAM Approach | How It Works | Integration Point |
+| Mode | How It Works | When to Use |
 |---|---|---|
-| **Manual assignment** | Operator or platform engineer assigns IPs in the CR spec | Direct: IPs written into `TalosMachine.spec.networkSpec.ipAddress` |
-| **Crossplane composition** | Composition pipeline receives explicit IPs as inputs (from a spreadsheet, CMDB, or parameter store) and templates them into generated CRs | Composition `spec.resources[].patches` |
-| **CAPI IPAM provider** | `InClusterIPPool` / `GlobalInClusterIPPool` from [cluster-api-ipam-provider-in-cluster](https://github.com/kubernetes-sigs/cluster-api-ipam-provider-in-cluster) allocates IPs and writes them to `IPAddressClaim` resources | Crossplane or controller reads `IPAddress` resources |
-| **Proxmox SDN IPAM** | Proxmox 8.1+ SDN module with built-in IPAM (PVE, NetBox, or phpIPAM backend). API: `GET /cluster/sdn/vnets/<vnet>/subnets/<subnet>/ips` | External controller or Crossplane function queries the Proxmox SDN API before generating CRs |
-| **External IPAM operator** | NetBox, Infoblox, or similar IPAM system with a Kubernetes operator that fulfills `IPAddressClaim` resources | Same pattern as CAPI IPAM provider |
+| **Explicit IP** | `ipAddress` field set directly on `TalosMachine.spec.networkSpec` | Small fleets, manual control, Crossplane composition with explicit IPs |
+| **Pool-based allocation** | `poolRef` references a `TalosIPPool` — operator allocates next free IP automatically | Larger fleets, automated provisioning, dynamic scaling |
 
-This separation follows the single-responsibility principle: talos-operator manages Talos machine lifecycle, kubemox manages Proxmox VMs, and IPAM is handled by the appropriate external system.
+Both modes produce the same outcome: a `TalosMachine` with a static IP used for META key (pre-install) and machine config patch (post-install). The pool-based mode simply automates the assignment step. See the **IP Address Management (IPAM)** section below for full CRD definitions, allocation algorithm, and webhook integration.
 
 **File**: `talos-operator/api/v1alpha1/taloscontrolplane_types.go:93`
 
-The `MetalSpec` struct does **not** change for IPAM. It retains its existing `Machines` list (machine endpoints) and `MachineSpec` (shared config). Each `TalosMachine` CR carries its own `NetworkSpec` with an explicit 1:1 IP assignment:
+The `MetalSpec` struct does **not** change. It retains its existing `Machines` list (machine endpoints) and `MachineSpec` (shared config). When pool-based allocation is used, the IPAM controller writes `status.allocatedIP` on each `TalosMachine`, and the `MetalSpec.Machines` list is populated from these allocated IPs:
 
 ```go
-// MetalSpec remains unchanged — no IPAM logic
+// MetalSpec remains unchanged
 type MetalSpec struct {
     // Machines is a list of machine endpoints (IPs or hostnames).
     // Each entry corresponds to a TalosMachine CR with its own NetworkSpec.
@@ -976,8 +987,6 @@ type MetalSpec struct {
     MachineSpec *MachineSpec `json:"machineSpec,omitempty"`
 }
 ```
-
-The IPs in `MetalSpec.Machines` must match the `NetworkSpec.IPAddress` on the corresponding `TalosMachine` CRs. This is a **declarative 1:1 mapping** — no allocation, no incrementing, no pool management.
 
 ---
 
@@ -1327,6 +1336,377 @@ spec:
 
 ---
 
+## IP Address Management (IPAM)
+
+### Design Rationale
+
+The 4 shortcomings above assume 1:1 explicit IP assignment per `TalosMachine`. This works for small fleets but becomes operationally burdensome at scale — every new machine needs a manually chosen, conflict-free IP.
+
+This section introduces **pool-based IP allocation** built directly into talos-operator. The allocation algorithm uses a sequential lowest-first scan over an `IPSet` — a well-understood pattern in Kubernetes IPAM implementations. There are **no external IPAM dependencies** (no CAPI, no external controllers).
+
+**Key design decisions:**
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| Allocation record | Separate `TalosIPAddress` CRD | Clean lifecycle, watchable by external controllers |
+| Manual + pool support | Both `ipAddress` and `poolRef` in `NetworkSpec` | Backward compatible; small fleets stay explicit |
+| External DHCP/firewall sync | Generic allocation webhooks | No vendor lock-in; works with pfSense, OPNsense, NetBox, etc. |
+| Concurrency | `MaxConcurrentReconciles: 1` on IPAM controller | Prevents double-allocation without distributed locking |
+| IP set library | `go4.org/netipx` (BSD, Brad Fitzpatrick) | Single dependency; used by CAPI, Tailscale, and Go stdlib contributors |
+
+### TalosIPPool CRD
+
+Defines a range of IPs available for allocation.
+
+```go
+// TalosIPPool defines a pool of IP addresses for automatic allocation to TalosMachines.
+type TalosIPPool struct {
+    metav1.TypeMeta   `json:",inline"`
+    metav1.ObjectMeta `json:"metadata,omitempty"`
+    Spec              TalosIPPoolSpec   `json:"spec,omitempty"`
+    Status            TalosIPPoolStatus `json:"status,omitempty"`
+}
+
+type TalosIPPoolSpec struct {
+    // Addresses is a list of IP ranges. Supports CIDR ("10.0.50.0/28"),
+    // ranges ("10.0.50.10-10.0.50.50"), and individual IPs ("10.0.50.100").
+    // +kubebuilder:validation:MinItems=1
+    Addresses []string `json:"addresses"`
+    // Prefix is the subnet prefix length (e.g., 24 for /24).
+    // +kubebuilder:validation:Minimum=1
+    // +kubebuilder:validation:Maximum=128
+    Prefix int `json:"prefix"`
+    // Gateway is the default gateway for allocated IPs.
+    // +kubebuilder:validation:Required
+    Gateway string `json:"gateway"`
+    // ExcludedAddresses are IPs within the range that should never be allocated
+    // (e.g., existing infrastructure, VIPs). Gateway is auto-excluded.
+    // +kubebuilder:validation:Optional
+    ExcludedAddresses []string `json:"excludedAddresses,omitempty"`
+    // AllocateReservedIPAddresses controls whether network and broadcast addresses
+    // are allocatable. When false (default), the first and last IPs of the subnet
+    // are excluded from allocation.
+    // +kubebuilder:default=false
+    // +kubebuilder:validation:Optional
+    AllocateReservedIPAddresses bool `json:"allocateReservedIPAddresses,omitempty"`
+    // AllocationWebhooks fire on allocate/deallocate events for external DHCP/firewall sync.
+    // +kubebuilder:validation:Optional
+    AllocationWebhooks []AllocationWebhook `json:"allocationWebhooks,omitempty"`
+}
+
+type TalosIPPoolStatus struct {
+    // Total is the number of allocatable addresses in the pool.
+    Total int `json:"total"`
+    // Used is the number of currently allocated addresses.
+    Used int `json:"used"`
+    // Free is Total - Used.
+    Free int `json:"free"`
+    // OutOfRange is the count of IPs that are allocated but no longer within
+    // the pool's address ranges (e.g., after shrinking the pool spec).
+    OutOfRange int `json:"outOfRange,omitempty"`
+}
+```
+
+**Example:**
+
+```yaml
+apiVersion: talos.alperen.cloud/v1alpha1
+kind: TalosIPPool
+metadata:
+  name: prod-workers
+  namespace: fleet
+spec:
+  addresses:
+    - "10.0.50.10-10.0.50.50"
+  prefix: 24
+  gateway: "10.0.50.1"
+  excludedAddresses:
+    - "10.0.50.1"   # gateway
+    - "10.0.50.10"  # VIP
+  allocationWebhooks:
+    - name: pfsense-dhcp
+      onAllocate:
+        url: "https://pfsense.lab/api/v1/services/dhcpd/static_mapping"
+        method: POST
+        template: |
+          {"interface":"opt1","ipaddr":"{{ .IP }}","mac":"{{ .MAC }}","hostname":"{{ .Name }}"}
+      onDeallocate:
+        url: "https://pfsense.lab/api/v1/services/dhcpd/static_mapping"
+        method: DELETE
+        template: |
+          {"interface":"opt1","ipaddr":"{{ .IP }}"}
+      credentialRef:
+        name: pfsense-api-creds
+      failurePolicy: Warn
+status:
+  total: 40
+  used: 12
+  free: 28
+```
+
+### TalosIPAddress CRD
+
+One `TalosIPAddress` is created per allocation. Garbage collected via `ownerRef` when the `TalosMachine` is deleted.
+
+```go
+// TalosIPAddress represents a single IP allocation from a TalosIPPool.
+type TalosIPAddress struct {
+    metav1.TypeMeta   `json:",inline"`
+    metav1.ObjectMeta `json:"metadata,omitempty"`
+    Spec              TalosIPAddressSpec `json:"spec,omitempty"`
+}
+
+type TalosIPAddressSpec struct {
+    // Address is the allocated IP.
+    Address string `json:"address"`
+    // Prefix is the subnet prefix length (copied from pool).
+    Prefix int `json:"prefix"`
+    // Gateway (copied from pool).
+    Gateway string `json:"gateway"`
+    // PoolRef is the pool this address was allocated from.
+    PoolRef corev1.LocalObjectReference `json:"poolRef"`
+    // MachineRef is the TalosMachine that owns this allocation.
+    MachineRef corev1.LocalObjectReference `json:"machineRef"`
+}
+```
+
+**Ownership and lifecycle:**
+
+```
+TalosMachine (with poolRef)
+  │
+  ├─ ownerRef ──→ TalosIPAddress (created by IPAM controller)
+  │                 labels:
+  │                   talos.alperen.cloud/pool: prod-workers
+  │                   talos.alperen.cloud/machine: prod-worker-3
+  │
+  └─ status.allocatedIP: "10.0.50.13"  (writeback from IPAM controller)
+```
+
+On `TalosMachine` deletion: Kubernetes garbage collection deletes `TalosIPAddress` via `ownerRef`. The IPAM controller's finalizer fires `onDeallocate` webhooks before the `TalosIPAddress` is removed. The IP returns to the pool's free set on the next reconciliation.
+
+### Allocation Algorithm
+
+Algorithm modeled after CAPI IPAM's `InClusterIPPool` controller (~320 lines of Go, implemented natively in talos-operator). Sequential scan, lowest-first, using `netipx.IPSet`:
+
+```go
+import "go4.org/netipx"
+
+// FindFreeAddress scans the pool range and returns the lowest unused IP.
+// poolIPSet: all IPs in the pool (from spec.addresses, minus excludedAddresses).
+// inUseIPSet: all IPs currently allocated (built from TalosIPAddress CRs).
+func FindFreeAddress(poolIPSet, inUseIPSet *netipx.IPSet) (netip.Addr, error) {
+    for _, iprange := range poolIPSet.Ranges() {
+        ip := iprange.From()
+        for {
+            if !inUseIPSet.Contains(ip) {
+                return ip, nil
+            }
+            if ip == iprange.To() {
+                break
+            }
+            ip = ip.Next()
+        }
+    }
+    return netip.Addr{}, errors.New("no address available in pool")
+}
+```
+
+Supporting utilities (also modeled after CAPI IPAM's `internal/poolutil/pool.go`):
+
+```go
+// AddressToIPSet converts a single address string to an IPSet.
+// Supports: individual IPs ("10.0.0.5"), CIDR ("10.0.0.0/24"), ranges ("10.0.0.10-10.0.0.50").
+func AddressToIPSet(addressStr string) (*netipx.IPSet, error) {
+    builder := &netipx.IPSetBuilder{}
+    if strings.Contains(addressStr, "-") {
+        addrRange, err := netipx.ParseIPRange(addressStr)
+        if err != nil { return nil, err }
+        builder.AddRange(addrRange)
+    } else if strings.Contains(addressStr, "/") {
+        prefix, err := netip.ParsePrefix(addressStr)
+        if err != nil { return nil, err }
+        builder.AddPrefix(prefix)
+    } else {
+        addr, err := netip.ParseAddr(addressStr)
+        if err != nil { return nil, err }
+        builder.Add(addr)
+    }
+    return builder.IPSet()
+}
+
+// PoolSpecToIPSet builds the allocatable IP set: addresses - excluded - reserved - gateway.
+func PoolSpecToIPSet(spec *TalosIPPoolSpec) (*netipx.IPSet, error) {
+    poolIPSet, err := AddressesToIPSet(spec.Addresses)
+    if err != nil { return nil, err }
+    builder := &netipx.IPSetBuilder{}
+    builder.AddSet(poolIPSet)
+    // Remove excluded addresses
+    if len(spec.ExcludedAddresses) > 0 {
+        excludedIPSet, _ := AddressesToIPSet(spec.ExcludedAddresses)
+        builder.RemoveSet(excludedIPSet)
+    }
+    // Remove network + broadcast (unless opted in)
+    if !spec.AllocateReservedIPAddresses {
+        subnet := netip.PrefixFrom(poolIPSet.Ranges()[0].From(), spec.Prefix)
+        subnetRange := netipx.RangeOfPrefix(subnet)
+        builder.Remove(subnetRange.From())               // network address
+        if subnet.Addr().Is4() { builder.Remove(subnetRange.To()) } // broadcast
+    }
+    // Remove gateway
+    if spec.Gateway != "" {
+        gateway, _ := netip.ParseAddr(spec.Gateway)
+        builder.Remove(gateway)
+    }
+    return builder.IPSet()
+}
+```
+
+**No persistent allocation table.** The in-use set is rebuilt each reconciliation by listing all `TalosIPAddress` CRs with the pool's label selector. Kubernetes itself is the database — the set of `TalosIPAddress` CRs in etcd IS the allocation table. The gateway is automatically included in the in-use set to prevent accidental allocation.
+
+**Concurrency:** `MaxConcurrentReconciles: 1` on the IPAM controller. This prevents two machines from claiming the same IP simultaneously without requiring distributed locks. After each allocation, the controller polls until the informer cache has seen the new `TalosIPAddress` before processing the next claim — this prevents a race where the cache-based list misses a just-created allocation:
+
+```go
+// Cache consistency wait after allocation (prevents double-allocation)
+err = wait.PollUntilContextTimeout(ctx, 5*time.Millisecond, 5*time.Second, true,
+    func(ctx context.Context) (bool, error) {
+        if err := r.Client.Get(ctx, client.ObjectKeyFromObject(&ipAddr), &TalosIPAddress{}); err != nil {
+            return false, client.IgnoreNotFound(err)
+        }
+        return true, nil
+    })
+```
+
+At fleet scale (~100 machines), single-threaded allocation adds negligible latency since `FindFreeAddress` is O(n) over the range and the cache wait is typically <50ms.
+
+**Pool deletion protection:** The pool has a finalizer (`talos.alperen.cloud/protect-pool`) that is only removed when `inUseCount == 0`. This prevents accidental deletion of a pool that still has active allocations.
+
+**Status recomputation:** Pool status (`total`, `used`, `free`, `outOfRange`) is recomputed from scratch on each reconciliation — never incremented. The pool reconciler runs whenever a `TalosIPAddress` referencing the pool is created, modified, or deleted (via Watch).
+
+### Generic Allocation Webhooks
+
+Instead of building vendor-specific DHCP/firewall integrations (pfSense, OPNsense, MikroTik, etc.) into the operator, `TalosIPPool` supports generic webhooks that fire on allocation and deallocation events. The operator is the source of truth; external systems are sync targets.
+
+```go
+type AllocationWebhook struct {
+    // Name is a human-readable identifier for this webhook.
+    Name string `json:"name"`
+    // OnAllocate fires when an IP is allocated from this pool.
+    // +kubebuilder:validation:Optional
+    OnAllocate *WebhookAction `json:"onAllocate,omitempty"`
+    // OnDeallocate fires when an IP is released back to this pool.
+    // +kubebuilder:validation:Optional
+    OnDeallocate *WebhookAction `json:"onDeallocate,omitempty"`
+    // CredentialRef references a Secret with authentication for the webhook endpoint.
+    // The Secret must contain a "token" key used as Bearer token,
+    // or "username"/"password" keys for basic auth.
+    // +kubebuilder:validation:Optional
+    CredentialRef *corev1.LocalObjectReference `json:"credentialRef,omitempty"`
+    // FailurePolicy determines behavior when the webhook fails.
+    // "Fail" blocks the allocation. "Warn" logs and continues.
+    // +kubebuilder:default=Warn
+    // +kubebuilder:validation:Enum=Fail;Warn
+    FailurePolicy string `json:"failurePolicy,omitempty"`
+}
+
+type WebhookAction struct {
+    // URL is the webhook endpoint.
+    URL string `json:"url"`
+    // Method is the HTTP method (POST, PUT, DELETE, PATCH).
+    // +kubebuilder:validation:Enum=POST;PUT;DELETE;PATCH
+    Method string `json:"method"`
+    // Template is a Go text/template that renders the request body.
+    // Available variables: .IP, .Prefix, .Gateway, .MAC, .Name, .Namespace, .Pool
+    // +kubebuilder:validation:Optional
+    Template string `json:"template,omitempty"`
+}
+```
+
+**Webhook execution:**
+
+1. IPAM controller allocates IP → creates `TalosIPAddress` CR
+2. For each `onAllocate` webhook in the pool: render template, send HTTP request
+3. Retry 3x with exponential backoff (1s, 2s, 4s)
+4. If `failurePolicy: Warn` — log failure, continue (allocation is not rolled back)
+5. If `failurePolicy: Fail` — log failure, delete `TalosIPAddress`, requeue for retry
+
+**Template variables:**
+
+| Variable | Source | Example |
+|----------|--------|---------|
+| `{{ .IP }}` | Allocated address | `10.0.50.13` |
+| `{{ .Prefix }}` | Pool prefix | `24` |
+| `{{ .Gateway }}` | Pool gateway | `10.0.50.1` |
+| `{{ .MAC }}` | TalosMachine MAC | `BC:24:11:AA:BB:13` |
+| `{{ .Name }}` | TalosMachine name | `prod-worker-3` |
+| `{{ .Namespace }}` | TalosMachine namespace | `fleet` |
+| `{{ .Pool }}` | TalosIPPool name | `prod-workers` |
+
+### Reconciliation Flow
+
+```
+TalosMachine created (with poolRef: prod-workers)
+  │
+  ├─ IPAM Controller (MaxConcurrentReconciles: 1)
+  │   ├─ List TalosIPAddress CRs with label pool=prod-workers
+  │   ├─ Build inUseIPSet from existing allocations
+  │   ├─ FindFreeAddress(poolIPSet, inUseIPSet) → 10.0.50.13
+  │   ├─ Create TalosIPAddress CR (ownerRef: TalosMachine, labels: pool + machine)
+  │   ├─ Fire onAllocate webhooks (pfSense DHCP static mapping, etc.)
+  │   ├─ Write status.allocatedIP = "10.0.50.13" on TalosMachine
+  │   └─ Update TalosIPPool status (used++, free--)
+  │
+  ├─ TalosMachine Controller (sees status.allocatedIP populated)
+  │   ├─ Uses allocatedIP instead of spec.networkSpec.ipAddress
+  │   ├─ Generates META key patch + static network patch as normal
+  │   └─ Proceeds with VM creation
+  │
+  └─ TalosMachine deleted
+      ├─ Finalizer on TalosIPAddress fires onDeallocate webhooks
+      ├─ TalosIPAddress garbage collected via ownerRef
+      └─ Pool status updated on next reconcile (used--, free++)
+```
+
+### Crossplane Integration
+
+When using Crossplane v2 compositions (pipeline mode), the `TalosKubernetesCluster` claim can reference a pool:
+
+```yaml
+apiVersion: talos.axonnetworks.io/v1alpha1
+kind: TalosKubernetesCluster
+metadata:
+  name: prod-cluster
+spec:
+  controlPlane:
+    replicas: 3
+    network:
+      poolRef:
+        name: cp-pool       # allocate from cp-pool
+      gateway: "10.0.1.1"   # override if needed (otherwise pool gateway used)
+  workers:
+    - name: compute
+      replicas: 5
+      network:
+        poolRef:
+          name: worker-pool  # allocate from worker-pool
+```
+
+The composition pipeline generates `TalosMachine` CRs with `poolRef` set. The IPAM controller allocates IPs before the TalosMachine controller proceeds with VM creation — no manual IP assignment needed.
+
+### Estimated Scope
+
+| Component | Estimated Lines | Notes |
+|-----------|----------------|-------|
+| `TalosIPPool` CRD types | ~60 | Spec, Status, webhook types |
+| `TalosIPAddress` CRD types | ~30 | Spec only (no status needed) |
+| `NetworkSpec` modification | ~15 | Add `PoolRef`, CEL validation |
+| IPAM controller | ~320 | Allocation, deallocation, pool status, webhook dispatch |
+| Webhook engine | ~150 | Template rendering, HTTP dispatch, retry, credential loading |
+| Tests | ~200 | Unit tests for `FindFreeAddress`, webhook dispatch, reconciliation |
+| **Total** | **~775** | Pure Go, single external dependency (`go4.org/netipx`) |
+
+---
+
 ## Summary of Changes by Project
 
 ### kubemox (5 changes)
@@ -1347,16 +1727,19 @@ Import: `github.com/luthermonson/go-proxmox v0.3.2` → replaced by `github.com/
 
 `VirtualMachineCloneOptions.NewID int` already exists in the struct (JSON tag `"newid"`). kubemox just doesn't set it. No fork changes required — only kubemox needs to populate `CloneOptions.NewID = vm.Spec.VMID`.
 
-### talos-operator (4 changes)
+### talos-operator (7 changes)
 
-| Change | File (current line refs) | Description |
+| Change | File | Description |
 |---|---|---|
-| Add `NetworkSpec` to `TalosMachineSpec` | `api/v1alpha1/talosmachine_types.go` (after line 53) | Static IP + SR-IOV config per machine (1:1 explicit assignment) |
-| Add `DataVolume` to `MachineSpec` | Same file (after line 88) | UserVolumeConfig-based data disk management (Talos 1.10+) |
+| Add `NetworkSpec` with `poolRef` to `TalosMachineSpec` | `api/v1alpha1/talosmachine_types.go` (after line 53) | Static IP (explicit) or pool-based allocation per machine |
+| Add `TalosIPPool` CRD | `api/v1alpha1/talosippool_types.go` (new file) | Pool definition with ranges, gateway, webhooks |
+| Add `TalosIPAddress` CRD | `api/v1alpha1/talosipaddress_types.go` (new file) | Per-allocation record with ownerRef to TalosMachine |
+| Add `DataVolume` to `MachineSpec` | `api/v1alpha1/talosmachine_types.go` (after line 88) | UserVolumeConfig-based data disk management (Talos 1.10+) |
+| IPAM controller | `internal/controller/talosippool_controller.go` (new file) | Allocation, deallocation, pool status, webhook dispatch (~320 lines) |
 | Static network + UserVolumeConfig patch generation | `pkg/talos/bundle.go` (after line 40) | New patch templates alongside existing ones |
-| Apply network + volume patches | `internal/controller/talosmachine_controller.go` (in `metalConfigPatches()` at line 431) | Wire into reconcile loop |
+| Apply network + volume patches | `internal/controller/talosmachine_controller.go` (in `metalConfigPatches()` at line 431) | Wire into reconcile loop; use `status.allocatedIP` when `poolRef` is set |
 
-**Note**: `MetalSpec` (`taloscontrolplane_types.go:93-99`) is **unchanged** — no IPAM logic added. IPAM is an external concern.
+**Note**: `MetalSpec` (`taloscontrolplane_types.go:93-99`) is **unchanged**. IPAM is managed by the dedicated `TalosIPPool` controller within talos-operator. External dependency: `go4.org/netipx` (BSD license).
 
 ### Crossplane (new)
 
@@ -1442,6 +1825,21 @@ Every technical claim in this document has been verified against primary sources
 | X4 | `gotemplating.fn.crossplane.io/composition-resource-name` annotation names composed resources | GitHub docs | [function-go-templating README](https://github.com/crossplane-contrib/function-go-templating) | VERIFIED |
 | X5 | XRD (`CompositeResourceDefinition`) defines the composite type; v2 XRDs support `scope` field | Official docs | [XRD docs](https://docs.crossplane.io/latest/composition/composite-resource-definitions/) | VERIFIED |
 
+### IPAM Design Claims
+
+| # | Claim | Source Type | Source | Status |
+|---|---|---|---|---|
+| I1 | CAPI IPAM `FindFreeAddress` uses sequential lowest-first scan with `netipx.IPSet` | Source code | [`internal/poolutil/pool.go`](https://github.com/kubernetes-sigs/cluster-api-ipam-provider-in-cluster) | VERIFIED — read from source |
+| I2 | CAPI IPAM concurrency model is `MaxConcurrentReconciles: 1` with no distributed locks | Source code | [`internal/controllers/ipaddressclaim.go`](https://github.com/kubernetes-sigs/cluster-api-ipam-provider-in-cluster) | VERIFIED — explicit comment in source |
+| I3 | CAPI IPAM has no persistent allocation table — rebuilt from IPAddress CRs each reconciliation | Source code | `internal/controllers/ipaddressclaim.go` `EnsureAddress()` | VERIFIED |
+| I4 | CAPI IPAM uses cache consistency poll (5ms interval, 5s timeout) after allocation | Source code | `pkg/ipamutil/reconciler.go` | VERIFIED |
+| I5 | Core CAPI IPAM allocation logic is ~320 lines of Go | Source code analysis | See `capi-ipam-allocation-analysis.md` line-by-line breakdown | VERIFIED |
+| I6 | `go4.org/netipx` is BSD-licensed, by Brad Fitzpatrick, ~2000 LOC, no transitive deps | Package metadata | [go4.org/netipx](https://pkg.go.dev/go4.org/netipx) | VERIFIED |
+| I7 | CAPI IPAM pool deletion protected by finalizer, only removed when `inUseCount == 0` | Source code | `internal/controllers/inclusterippool.go` `genericReconcile()` | VERIFIED |
+| I8 | CAPI IPAM status (total/used/free/outOfRange) recomputed from scratch, never incremented | Source code | Same as I7 | VERIFIED |
+| I9 | CAPI IPAM deallocation is a no-op — deleting IPAddress CR IS deallocation | Source code | `internal/controllers/ipaddressclaim.go` `ReleaseAddress()` returns nil | VERIFIED |
+| I10 | CAPI IPAM address format supports CIDR, hyphenated ranges, and individual IPs | Source code | `internal/poolutil/pool.go` `AddressToIPSet()` | VERIFIED |
+
 ### Codebase References (All Verified)
 
 | # | Claim | File:Line | Status |
@@ -1496,11 +1894,13 @@ Every technical claim in this document has been verified against primary sources
 - [Proxmox PCI Passthrough / SR-IOV](https://pve.proxmox.com/wiki/PCI_Passthrough)
 - [Proxmox VM Cloning and MAC Behavior](https://forum.proxmox.com/threads/when-cloning-a-kvm-vm-the-mac-address-is-renewed.28153/)
 
-### IPAM Ecosystem
+### IPAM Design References
 
-- [cluster-api-ipam-provider-in-cluster](https://github.com/kubernetes-sigs/cluster-api-ipam-provider-in-cluster) — `InClusterIPPool`, `GlobalInClusterIPPool` (API group: `ipam.cluster.x-k8s.io`)
-- [CAPI IPAM Provider Contract](https://cluster-api.sigs.k8s.io/developer/providers/contracts/ipam) — `IPAddressClaim` / `IPAddress` CRDs
-- [CAPI IPAM Integration Proposal](https://github.com/kubernetes-sigs/cluster-api/blob/main/docs/proposals/20220125-ipam-integration.md)
+- [cluster-api-ipam-provider-in-cluster](https://github.com/kubernetes-sigs/cluster-api-ipam-provider-in-cluster) — Design reference for TalosIPPool/TalosIPAddress CRDs (allocation algorithm, concurrency model, pool status)
+- [CAPI IPAM Provider Contract](https://cluster-api.sigs.k8s.io/developer/providers/contracts/ipam) — Reference architecture for `IPAddressClaim` / `IPAddress` patterns
+- [CAPI IPAM Integration Proposal](https://github.com/kubernetes-sigs/cluster-api/blob/main/docs/proposals/20220125-ipam-integration.md) — Original design rationale
+- [CAPI IPAM Allocation Analysis](capi-ipam-allocation-analysis.md) — Source code deep-dive of CAPI IPAM allocation logic (local analysis document)
+- [go4.org/netipx](https://pkg.go.dev/go4.org/netipx) — BSD-licensed IP set library (Brad Fitzpatrick), single external dependency for allocation
 
 ### Other
 
