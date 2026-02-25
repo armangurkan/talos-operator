@@ -659,9 +659,9 @@ Talos exposes disk metadata that the `VolumeConfig` `diskSelector` CEL expressio
 |---|---|---|
 | `disk.size` | Disk capacity | `24000000000` (bytes) |
 | `disk.transport` | Bus type | `"scsi"` |
-| `disk.bus_path` | Kernel device path | `"/dev/sdb"` |
+| `disk.bus_path` | PCI/sysfs bus path (stable across reboots) | `"/pci0000:00/0000:00:07.0/virtio4/host1/target1:0:0/1:0:0:0"` |
 | `disk.serial` | Disk serial number | `"lun-24g-001"` (from iSCSI target) |
-| `disk.name` | Kernel name | `"sdb"` |
+| `disk.dev_path` | Linux block device path | `"/dev/sdb"` |
 
 **Serial number** is the most reliable discriminator for iSCSI LUNs because Proxmox propagates the zvol name as the SCSI serial. This means the `diskSelector` can match specific LUNs without relying on enumeration order:
 
@@ -1017,6 +1017,7 @@ spec:
       memory: 16384
       bootDiskGB: 50
       dataDisks:
+<<<<<<< HEAD
         # UserVolumeConfig mounts at /var/mnt/<name> automatically
         - name: data-shard-1
           size: 24
