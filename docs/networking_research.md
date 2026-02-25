@@ -14,7 +14,7 @@
 
 **Networking**: SR-IOV passthrough VNFs from high-speed NICs (Proxmox resource mappings) with virtio bridge fallback. **Static IP only — no DHCP.**
 
-**Management**: Supervisor K8s cluster running kubemox + talos-operator. GitOps-friendly via Crossplane compositions (pipeline mode).
+**Management**: Supervisor K8s cluster running kubemox + talos-operator. GitOps-friendly via Crossplane v2 compositions (pipeline mode).
 
 ---
 
@@ -983,7 +983,7 @@ The IPs in `MetalSpec.Machines` must match the `NetworkSpec.IPAddress` on the co
 
 ## Crossplane Composition: GitOps Orchestration
 
-A Crossplane composition (pipeline mode) provides the user-facing API — a single `TalosKubernetesCluster` Claim that generates all the underlying resources with deterministic IPs, VMIDs, and disk configs.
+A Crossplane v2 composition (pipeline mode) provides the user-facing API — a single `TalosKubernetesCluster` Claim that generates all the underlying resources with deterministic IPs, VMIDs, and disk configs.
 
 ### The Claim (What Users Write)
 
