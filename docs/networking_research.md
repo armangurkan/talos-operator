@@ -838,32 +838,24 @@ CloneOptions.Target = nodeName
 newID, task, err := templateVM.Clone(ctx, &CloneOptions)
 ```
 
-The `go-proxmox` library's `VirtualMachineCloneOptions` does NOT have a VMID field. kubemox uses a fork: `github.com/alperencelik/go-proxmox v0.0.0-20260201203053-5a1bc2aed607`.
+kubemox uses a fork: `github.com/alperencelik/go-proxmox v0.0.0-20260201203053-5a1bc2aed607`.
 
-The Proxmox API itself supports `newid` parameter in `POST /nodes/{node}/qemu/{vmid}/clone`. The `go-proxmox` `CloneOptions` struct needs to be extended (or the fork patched).
+The Proxmox API itself supports `newid` parameter in `POST /nodes/{node}/qemu/{vmid}/clone`.
 
 ### Proposed Changes
 
-#### A. go-proxmox fork — Add VMID to CloneOptions
+#### A. go-proxmox — No fork changes needed
 
-**File**: `go-proxmox/types.go` (in the fork `alperencelik/go-proxmox`)
+The `VirtualMachineCloneOptions` struct in go-proxmox **already has** a `NewID int` field (JSON tag `"newid"`). kubemox simply doesn't set it. No fork patch is required — only kubemox needs to populate this field.
 
 ```go
-// CURRENT
+// EXISTING struct in go-proxmox (already correct):
 type VirtualMachineCloneOptions struct {
-    Full    int    `json:"full"`
-    Name    string `json:"name"`
-    Target  string `json:"target"`
-    // ...
-}
-
-// PROPOSED — add NewID
-type VirtualMachineCloneOptions struct {
-    Full    int    `json:"full"`
-    Name    string `json:"name"`
-    Target  string `json:"target"`
-    NewID   int    `json:"newid,omitempty"`  // If 0, Proxmox auto-assigns
-    // ...
+    NewID   int    `json:"newid"`
+    Full    uint8  `json:"full,omitempty"`
+    Name    string `json:"name,omitempty"`
+    Target  string `json:"target,omitempty"`
+    // ... other fields: BWLimit, Description, Format, Pool, SnapName, Storage
 }
 ```
 
@@ -1025,15 +1017,16 @@ spec:
       memory: 16384
       bootDiskGB: 50
       dataDisks:
-        - size: 24
+        # UserVolumeConfig mounts at /var/mnt/<name> automatically
+        - name: data-shard-1
+          size: 24
           iopsLimit: 500
-          mountPath: /var/data/shard-1
-        - size: 24
+        - name: data-shard-2
+          size: 24
           iopsLimit: 500
-          mountPath: /var/data/shard-2
-        - size: 64
+        - name: data-large
+          size: 64
           iopsLimit: 1000
-          mountPath: /var/data/large
     placement:
       mode: shared
       nodeNames:
@@ -1343,13 +1336,11 @@ spec:
 
 **kubemox concurrency**: `VMmaxConcurrentReconciles = 30` (`internal/controller/proxmox/virtualmachine_controller.go:51`)
 
-### go-proxmox fork (1 change)
+### go-proxmox fork (0 changes needed)
 
 Import: `github.com/luthermonson/go-proxmox v0.3.2` → replaced by `github.com/alperencelik/go-proxmox v0.0.0-20260201203053-5a1bc2aed607` (see `kubemox/go.mod:9,23`)
 
-| Change | File | Description |
-|---|---|---|
-| Add `NewID` to `VirtualMachineCloneOptions` | `types.go` | Support `newid` parameter in Proxmox `POST /nodes/{node}/qemu/{vmid}/clone` API |
+`VirtualMachineCloneOptions.NewID int` already exists in the struct (JSON tag `"newid"`). kubemox just doesn't set it. No fork changes required — only kubemox needs to populate `CloneOptions.NewID = vm.Spec.VMID`.
 
 ### talos-operator (4 changes)
 
@@ -1369,6 +1360,28 @@ Import: `github.com/luthermonson/go-proxmox v0.3.2` → replaced by `github.com/
 | XRD: `XTalosKubernetesCluster` | Composite resource definition |
 | Composition pipeline | go-templating steps for VMs, TalosCP, TalosWorker |
 | Claim: `TalosKubernetesCluster` | User-facing API |
+
+---
+
+## Known Risks & Forward-Compatibility Notes
+
+### JSON Patch vs Strategic Merge Patch
+
+The current talos-operator uses **JSON RFC 6902 patches** exclusively (see `pkg/talos/bundle.go`). However:
+
+- When `UserVolumeConfig` documents are appended as multi-doc YAML, JSON patches [may stop working](https://github.com/siderolabs/talos/issues/12005) because RFC 6902 doesn't support multi-document configs.
+- The proposed `StaticNetworkPatch` uses **strategic merge YAML**, which is the correct approach for multi-doc scenarios.
+- **Migration consideration**: Existing JSON patches (InstallDisk, InstallImage, WipeDisk, etc.) may need to be migrated to strategic merge format when multi-doc config is used.
+
+### Talos v1.12 Network Configuration Deprecation
+
+Talos v1.12 introduces new multi-doc network configuration documents (`LinkConfig`, `AddressConfig`, `RouteConfig`, `HostnameConfig`) that replace the legacy `.machine.network` config. The legacy format is supported for backwards compatibility but is deprecated. The proposed `StaticNetworkPatch` uses the legacy format, which is fine for Talos 1.10/1.11 but should be updated for 1.12+.
+
+### CEL Field Naming: snake_case vs camelCase
+
+- **Disk CEL selectors** (in `UserVolumeConfig`/`VolumeConfig`): Use **snake_case** — `disk.bus_path`, `disk.transport`, `disk.size`
+- **Network `deviceSelector`**: Uses **camelCase** — `hardwareAddr`, `busPath`, `driver`, `pciID`
+- This inconsistency is upstream in Talos itself — network selectors are camelCase, disk CEL expressions are snake_case.
 
 ---
 
@@ -1410,6 +1423,10 @@ Import: `github.com/luthermonson/go-proxmox v0.3.2` → replaced by `github.com/
 
 - [JYSK Tech: 3000+ Clusters with NoCloud](https://jysk.tech/3000-clusters-part-3-how-to-boot-talos-linux-nodes-with-cloud-init-and-nocloud-acdce36f60c0)
 - [siderolabs/omni-infra-provider-proxmox](https://github.com/siderolabs/omni-infra-provider-proxmox)
+- [GitHub Issue #12005 - Strategic Merge + Multi-Doc JSON Patch Conflict](https://github.com/siderolabs/talos/issues/12005)
+- [GitHub Issue #10080 - busPath/buspath CEL field rename in v1.9](https://github.com/siderolabs/talos/issues/10080)
+- [Talos Network Device Selector (v1.11)](https://www.talos.dev/v1.11/talos-guides/network/device-selector/)
+- [Talos Config Patches Documentation](https://docs.siderolabs.com/talos/v1.9/configure-your-talos-cluster/system-configuration/patching)
 
 ### Codebase References (Current State)
 
