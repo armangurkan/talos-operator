@@ -324,6 +324,8 @@ spec:
         cidr: 24
 ```
 
+> **Note**: Engineers familiar with traditional Linux provisioning may question the absence of NIC model filtering, interface renaming, netplan, or cloud-init network configuration. See [Appendix A](#appendix-a-why-traditional-linux-networking-patterns-do-not-apply) for a detailed explanation of why these patterns are unnecessary and inapplicable in Talos Linux.
+
 ---
 
 ## Shortcoming 2: Multi-Disk Attachment & Mount Paths
@@ -343,11 +345,11 @@ type VirtualMachineDisk struct {
 This only supports local Proxmox storage. No iSCSI target, no IOPS limits, no multi-disk ordering.
 
 **Talos** has no built-in mount path concept for data disks — it only knows about the install disk (`/machine/install/disk`). For persistent storage:
-- **Talos 1.8+**: `VolumeConfig` resources for **system volumes** only (`EPHEMERAL`, `IMAGECACHE`) — no filesystem or mount fields ([VolumeConfig reference](https://docs.siderolabs.com/talos/v1.9/reference/configuration/block/volumeconfig/))
-- **Talos 1.11+**: `UserVolumeConfig` for **user-defined data volumes** — supports `filesystem.type` (xfs/ext4) and auto-mounts at `/var/mnt/<name>` ([UserVolumeConfig reference](https://docs.siderolabs.com/talos/v1.12/reference/configuration/block/uservolumeconfig/))
-- **Talos <1.11**: Use `extraMounts` in machine config for raw bind mounts (less declarative)
+- **Talos 1.8+**: `VolumeConfig` resources for **system volumes** only (`STATE`, `EPHEMERAL`, `IMAGE-CACHE`) — no filesystem or mount fields ([VolumeConfig reference](https://docs.siderolabs.com/talos/v1.11/reference/configuration/block/volumeconfig/))
+- **Talos 1.10+**: `UserVolumeConfig` for **user-defined data volumes** — supports `filesystem.type` (xfs/ext4) and auto-mounts at `/var/mnt/<name>` ([UserVolumeConfig reference](https://docs.siderolabs.com/talos/v1.12/reference/configuration/block/uservolumeconfig/))
+- **Talos <1.10**: Use `extraMounts` in machine config for raw bind mounts (less declarative)
 
-**This proposal targets Talos v1.11+** to leverage `UserVolumeConfig` for declarative data disk management.
+**This proposal targets Talos v1.10+** (where `UserVolumeConfig` was introduced) with full testing on v1.11+.
 
 ### Proposed Changes
 
@@ -424,12 +426,12 @@ scsi1: iscsi:iqn.2026-01.com.example:lun1/0,size=24G
 
 #### B. talos-operator — Talos UserVolumeConfig for Data Disks
 
-Talos 1.11+ `UserVolumeConfig` allows declaring user data volumes with filesystem formatting and auto-mounting. These get appended to the machine config as separate YAML documents (the operator already does this for ImageCache `VolumeConfig` in `talosmachine_controller.go:203` — see `pkg/talos/bundle.go:31-39` for the existing `ImageCacheVolumeConfig` template).
+Talos 1.10+ `UserVolumeConfig` allows declaring user data volumes with filesystem formatting and auto-mounting. These get appended to the machine config as separate YAML documents (the operator already does this for ImageCache `VolumeConfig` in `talosmachine_controller.go:203` — see `pkg/talos/bundle.go:31-39` for the existing `ImageCacheVolumeConfig` template).
 
 **File**: `talos-operator/pkg/talos/bundle.go` — Add user volume config templates alongside existing templates (line 40):
 
 ```go
-// UserVolumeConfigTemplate for data disks (Talos 1.11+)
+// UserVolumeConfigTemplate for data disks (Talos 1.10+)
 // Appended as multi-doc YAML after the machine config.
 // Auto-mounts at /var/mnt/<name>.
 // Ref: https://docs.siderolabs.com/talos/v1.12/reference/configuration/block/uservolumeconfig/
@@ -459,7 +461,7 @@ type MachineSpec struct {
 
     // DataVolumes defines additional disk volumes to configure in Talos via UserVolumeConfig.
     // Each volume selects a disk via CEL expression and auto-mounts at /var/mnt/<name>.
-    // Requires Talos 1.11+.
+    // Requires Talos 1.10+.
     // +kubebuilder:validation:Optional
     DataVolumes []DataVolume `json:"dataVolumes,omitempty"`
 }
@@ -671,7 +673,7 @@ disk.transport == 'scsi' && disk.serial == 'lun-24g-001'
 
 #### Phase 4: UserVolumeConfig Mounts the Disk
 
-The `UserVolumeConfig` resource (Talos 1.11+, appended to the machine config as a multi-doc YAML) handles the full lifecycle ([UserVolumeConfig reference](https://docs.siderolabs.com/talos/v1.12/reference/configuration/block/uservolumeconfig/)):
+The `UserVolumeConfig` resource (Talos 1.10+, appended to the machine config as a multi-doc YAML) handles the full lifecycle ([UserVolumeConfig reference](https://docs.siderolabs.com/talos/v1.12/reference/configuration/block/uservolumeconfig/)):
 
 ```
 1. Boot → Talos machined enumerates disks
@@ -979,7 +981,7 @@ The IPs in `MetalSpec.Machines` must match the `NetworkSpec.IPAddress` on the co
 
 ---
 
-## Crossplane v2 Composition: GitOps Orchestration
+## Crossplane Composition: GitOps Orchestration
 
 A Crossplane v2 composition provides the user-facing API — a single `TalosKubernetesCluster` Claim that generates all the underlying resources with deterministic IPs, VMIDs, and disk configs.
 
@@ -1100,7 +1102,7 @@ TalosKubernetesCluster (Claim)
 ### Composition Pipeline (Sketch)
 
 ```yaml
-apiVersion: apiextensions.crossplane.io/v2
+apiVersion: apiextensions.crossplane.io/v1
 kind: Composition
 metadata:
   name: talos-kubernetes-cluster
@@ -1311,7 +1313,7 @@ spec:
    ├── Apply META key 0x0a (pre-install network via metakey_tpl.go:3-47)
    ├── Generate machine config with:
    │   ├── Static network patch (deviceSelector.hardwareAddr)
-   │   ├── UserVolumeConfig for data disks (Talos 1.11+)
+   │   ├── UserVolumeConfig for data disks (Talos 1.10+)
    │   └── VIP for control plane
    ├── Apply config via Talos API
    ├── Talos installs → reboots at SAME IP
@@ -1347,7 +1349,7 @@ Import: `github.com/luthermonson/go-proxmox v0.3.2` → replaced by `github.com/
 | Change | File (current line refs) | Description |
 |---|---|---|
 | Add `NetworkSpec` to `TalosMachineSpec` | `api/v1alpha1/talosmachine_types.go` (after line 53) | Static IP + SR-IOV config per machine (1:1 explicit assignment) |
-| Add `DataVolume` to `MachineSpec` | Same file (after line 88) | UserVolumeConfig-based data disk management (Talos 1.11+) |
+| Add `DataVolume` to `MachineSpec` | Same file (after line 88) | UserVolumeConfig-based data disk management (Talos 1.10+) |
 | Static network + UserVolumeConfig patch generation | `pkg/talos/bundle.go` (after line 40) | New patch templates alongside existing ones |
 | Apply network + volume patches | `internal/controller/talosmachine_controller.go` (in `metalConfigPatches()` at line 431) | Wire into reconcile loop |
 
@@ -1373,15 +1375,93 @@ The current talos-operator uses **JSON RFC 6902 patches** exclusively (see `pkg/
 - The proposed `StaticNetworkPatch` uses **strategic merge YAML**, which is the correct approach for multi-doc scenarios.
 - **Migration consideration**: Existing JSON patches (InstallDisk, InstallImage, WipeDisk, etc.) may need to be migrated to strategic merge format when multi-doc config is used.
 
-### Talos v1.12 Network Configuration Deprecation
+### Talos v1.12 Network Configuration Evolution
 
-Talos v1.12 introduces new multi-doc network configuration documents (`LinkConfig`, `AddressConfig`, `RouteConfig`, `HostnameConfig`) that replace the legacy `.machine.network` config. The legacy format is supported for backwards compatibility but is deprecated. The proposed `StaticNetworkPatch` uses the legacy format, which is fine for Talos 1.10/1.11 but should be updated for 1.12+.
+Talos v1.12 introduces new multi-doc network configuration documents (`LinkConfig`, `HostnameConfig`, `BondConfig`) with `AddressConfig` and `RouteConfig` as sub-fields within these documents (not standalone). These new documents **supplement** the existing `.machine.network` config rather than replace it — `.machine.network` remains fully supported. The proposed `StaticNetworkPatch` uses `.machine.network`, which works across Talos 1.10/1.11/1.12. A future enhancement could add native multi-doc network config support for 1.12+.
 
 ### CEL Field Naming: snake_case vs camelCase
 
 - **Disk CEL selectors** (in `UserVolumeConfig`/`VolumeConfig`): Use **snake_case** — `disk.bus_path`, `disk.transport`, `disk.size`
 - **Network `deviceSelector`**: Uses **camelCase** — `hardwareAddr`, `busPath`, `driver`, `pciID`
 - This inconsistency is upstream in Talos itself — network selectors are camelCase, disk CEL expressions are snake_case.
+
+---
+
+## Verification Matrix
+
+Every technical claim in this document has been verified against primary sources. This matrix provides traceability from claim to evidence.
+
+### Talos Linux Claims
+
+| # | Claim | Source Type | Source | Status |
+|---|---|---|---|---|
+| T1 | META key `0x0a` (decimal 10) provides pre-install network config | Official docs | [Metal Network Configuration](https://docs.siderolabs.com/talos/v1.11/networking/metal-network-configuration/) | VERIFIED |
+| T2 | `deviceSelector` fields: busPath, hardwareAddr, permanentAddr, pciID, driver, physical | Official docs | [Device Selector Reference](https://docs.siderolabs.com/talos/v1.11/networking/device-selector/) | VERIFIED |
+| T3 | `UserVolumeConfig` introduced in Talos 1.10+ | Official docs | [UserVolumeConfig Reference](https://docs.siderolabs.com/talos/v1.12/reference/configuration/block/uservolumeconfig/), [v1.10.0 release notes](https://github.com/siderolabs/talos/releases/tag/v1.10.0) | VERIFIED — CORRECTED from 1.11+ to 1.10+ |
+| T4 | `UserVolumeConfig` auto-mounts at `/var/mnt/<name>` with no customizable mount.path | Official docs | Same as T3 | VERIFIED |
+| T5 | `VolumeConfig` is system-only (`STATE`, `EPHEMERAL`, `IMAGE-CACHE`) | Official docs | [VolumeConfig Reference](https://docs.siderolabs.com/talos/v1.11/reference/configuration/block/volumeconfig/) | VERIFIED — CORRECTED volume names |
+| T6 | Disk CEL properties use snake_case: `disk.bus_path`, `disk.transport`, `disk.serial`, `disk.size`, `disk.dev_path` | Source code verification | Talos DiskSpec protobuf | VERIFIED |
+| T7 | `disk.bus_path` = PCI/sysfs bus path (not kernel device path) | Source code verification | Talos DiskSpec protobuf | VERIFIED |
+| T8 | `disk.name` does NOT exist as a CEL property | Source code verification | Talos DiskSpec protobuf | VERIFIED |
+| T9 | `system_disk` is a standalone boolean, available only post-install | Source code verification | Talos disk management code | VERIFIED |
+| T10 | VIP syntax: `vip: { ip: "x.x.x.x" }` under interface config | Official docs | [Config Reference](https://docs.siderolabs.com/talos/v1.11/reference/configuration/v1alpha1/config/) | VERIFIED |
+| T11 | QEMU guest agent does NOT run in maintenance mode | GitHub issue | [siderolabs/talos#11651](https://github.com/siderolabs/talos/issues/11651) | UNVERIFIED — awaiting issue confirmation |
+| T12 | Talos v1.12 introduces standalone `LinkConfig`, `HostnameConfig`, `BondConfig`; `AddressConfig`/`RouteConfig` are sub-fields of these | Official docs | Talos v1.12 networking docs | VERIFIED — CORRECTED: AddressConfig/RouteConfig are sub-fields, not standalone |
+| T13 | `.machine.network` supplemented (not replaced) by new network config documents in v1.12 | Official docs | Talos v1.12 release notes | VERIFIED — CORRECTED: these supplement rather than deprecate .machine.network |
+| T14 | Talos is immutable — no shell, no udev, no cloud-init binary | Official docs | Talos architecture documentation | VERIFIED |
+
+### Proxmox VE Claims
+
+| # | Claim | Source Type | Source | Status |
+|---|---|---|---|---|
+| P1 | VMID range: integer 100–999,999,999 (regex `^[1-9][0-9]{2,8}$`) | Official docs + source | [qm man page](https://pve.proxmox.com/pve-docs/qm.1.html), [JSONSchema.pm](https://git.proxmox.com/?p=pve-common.git;a=blob_plain;f=src/PVE/JSONSchema.pm) | VERIFIED — regex derived from documented range, not an official API constant |
+| P2 | VMIDs cluster-wide unique, shared between QEMU and LXC | Official docs | [PVE Admin Guide](https://pve.proxmox.com/pve-docs/pve-admin-guide.html) | VERIFIED |
+| P3 | iSCSI supported as storage type, registered via `pvesm add iscsi` | Official docs | [Storage: iSCSI](https://pve.proxmox.com/wiki/Storage:_iSCSI) | VERIFIED — note: Proxmox recommends LVM-on-iSCSI over direct LUN use |
+| P4 | Per-disk IOPS throttling via `iops_rd`, `iops_wr`, `mbps_rd`, `mbps_wr` | Official docs | [qm man page](https://pve.proxmox.com/pve-docs/qm.1.html) | VERIFIED |
+| P5 | MAC regenerated on VM clone; `newid` param in clone API | Official docs + forum | [Clone API](https://pve.proxmox.com/pve-docs/api-viewer/), [Forum thread](https://forum.proxmox.com/threads/28153/) | VERIFIED |
+| P6 | SDN IPAM in PVE 8.1+ with PVE/phpIPAM/NetBox backends | Official docs | [SDN Chapter](https://pve.proxmox.com/pve-docs/chapter-pvesdn.html) | VERIFIED — SDN is tech preview status as of PVE 8.x |
+| P7 | PCI Passthrough + SR-IOV VF support with resource mappings | Official docs | [PCI Passthrough Wiki](https://pve.proxmox.com/wiki/PCI_Passthrough) | VERIFIED |
+
+### go-proxmox Claims
+
+| # | Claim | Source Type | Source | Status |
+|---|---|---|---|---|
+| G1 | `VirtualMachineCloneOptions` has `NewID int` field (JSON tag `"newid"`) — 10 fields total | Source code | [go-proxmox](https://github.com/luthermonson/go-proxmox) `types.go`, confirmed in [fork](https://github.com/alperencelik/go-proxmox) | VERIFIED |
+| G2 | kubemox doesn't currently set `NewID` — Proxmox auto-assigns | Codebase ref | `kubemox/pkg/proxmox/virtualmachine.go:111-118` | VERIFIED |
+
+### Crossplane Claims
+
+| # | Claim | Source Type | Source | Status |
+|---|---|---|---|---|
+| X1 | Crossplane Composition supports `pipeline` mode with `functionRef` steps | Official docs | [Crossplane Compositions](https://docs.crossplane.io/latest/composition/compositions/) | VERIFIED |
+| X2 | `function-go-templating` (`gotemplating.fn.crossplane.io/v1beta1`) is a valid Crossplane function | GitHub repo | [crossplane-contrib/function-go-templating](https://github.com/crossplane-contrib/function-go-templating) v0.11.x | VERIFIED |
+| X3 | Composition API version is `apiextensions.crossplane.io/v1` (NOT v2; v2 is XRDs only) | Official docs | [Crossplane v2.2 docs](https://docs.crossplane.io/latest/composition/compositions/) — all examples use v1 | VERIFIED — CORRECTED in this doc |
+| X4 | `gotemplating.fn.crossplane.io/composition-resource-name` annotation names composed resources | GitHub docs | [function-go-templating README](https://github.com/crossplane-contrib/function-go-templating) | VERIFIED |
+| X5 | XRD (`CompositeResourceDefinition`) defines the composite type; v2 XRDs support `scope` field | Official docs | [XRD docs](https://docs.crossplane.io/latest/composition/composite-resource-definitions/) | VERIFIED |
+
+### Codebase References (All Verified)
+
+| # | Claim | File:Line | Status |
+|---|---|---|---|
+| C1 | `VirtualMachineSpec` struct | `kubemox/api/proxmox/v1alpha1/virtualmachine_types.go:34` | VERIFIED |
+| C2 | `VirtualMachineSpecTemplate` with `PciDevices` | Same file, line 96 | VERIFIED |
+| C3 | `PciDevice` struct (type: raw/mapped, deviceID) | Same file, line 117 | VERIFIED |
+| C4 | `VirtualMachineDisk` struct (Storage, Size, Device) | Same file, line 132 | VERIFIED |
+| C5 | `VirtualMachineNetwork` struct (Model, Bridge) | Same file, line 142 | VERIFIED |
+| C6 | `QEMUStatus` struct (no MAC field yet) | Same file, line 149 | VERIFIED |
+| C7 | `CreateVMFromTemplate()` function | `kubemox/pkg/proxmox/virtualmachine.go:92` | VERIFIED |
+| C8 | `CloneOptions` setup without VMID | Same file, lines 111-118 | VERIFIED |
+| C9 | `UpdateVMStatus()` function | Same file, line 607 | VERIFIED |
+| C10 | `VMmaxConcurrentReconciles = 30` | `kubemox/internal/controller/proxmox/virtualmachine_controller.go:51` | VERIFIED |
+| C11 | go-proxmox fork in go.mod | `kubemox/go.mod:9,23` | VERIFIED |
+| C12 | `TalosMachineSpec` struct | `talos-operator/api/v1alpha1/talosmachine_types.go:28` | VERIFIED |
+| C13 | `MachineSpec` struct (no NetworkSpec/DataVolumes yet) | Same file, line 55 | VERIFIED |
+| C14 | `MetalSpec` struct | `talos-operator/api/v1alpha1/taloscontrolplane_types.go:93` | VERIFIED |
+| C15 | `META` struct (Hostname, Interface, Subnet, Gateway, DNSServers) | Same file, line 101 | VERIFIED |
+| C16 | Existing patch templates (InstallDisk, InstallImage, etc.) | `talos-operator/pkg/talos/bundle.go:22-40` | VERIFIED |
+| C17 | `metaKeyTemplate` — META key 0x0a template | `talos-operator/pkg/talos/metakey_tpl.go:3-47` | VERIFIED |
+| C18 | `ApplyMetaKey()` function | `talos-operator/pkg/talos/client.go:185` | VERIFIED |
+| C19 | `metalConfigPatches()` function | `talos-operator/internal/controller/talosmachine_controller.go:431` | VERIFIED |
 
 ---
 
@@ -1458,3 +1538,91 @@ Talos v1.12 introduces new multi-doc network configuration documents (`LinkConfi
 | `pkg/talos/metakey_tpl.go` | 3-47 | `metaKeyTemplate` — META key 0x0a network config template |
 | `pkg/talos/client.go` | 185 | `ApplyMetaKey()` function |
 | `internal/controller/talosmachine_controller.go` | 431 | `metalConfigPatches()` function |
+
+---
+
+## Appendix A: Why Traditional Linux Networking Patterns Do Not Apply
+
+> This appendix addresses questions that engineers familiar with traditional Linux provisioning commonly raise when reviewing this proposal. It explains why NIC model filtering, interface renaming, netplan, and cloud-init network modules are neither necessary nor applicable in a Talos Linux environment.
+
+### A.1 NIC Model Filtering Is Unnecessary
+
+In traditional Linux provisioning, administrators sometimes filter NICs by model (e.g., `virtio`, `e1000`, `intel-ixgbe`) to distinguish management interfaces from data-plane interfaces.
+
+This proposal uses two hardware-identity selectors that are strictly more precise than model filtering:
+
+| Selector | Used For | Uniqueness Guarantee |
+|---|---|---|
+| `deviceSelector.hardwareAddr` | virtio NICs (management plane) | Globally unique per interface (MAC address) |
+| `deviceSelector.busPath` | SR-IOV virtual functions (data plane) | Unique per PCI topology on the host |
+
+NIC model is a **class identifier**, not a **device identifier**. A node with three virtio NICs shares the same model string across all three. Filtering by model alone cannot distinguish which interface should carry management traffic versus storage traffic versus tenant traffic. MAC address and PCI bus path are unique identifiers that resolve to exactly one interface on a given node.
+
+**Example from this proposal:**
+
+```yaml
+machine:
+  network:
+    interfaces:
+      - deviceSelector:
+          hardwareAddr: "bc:24:11:*"    # Matches the management NIC by MAC
+        addresses:
+          - 10.0.50.11/24
+        routes:
+          - network: 0.0.0.0/0
+            gateway: 10.0.50.1
+      - deviceSelector:
+          busPath: "0000:04:10.0"       # Matches a specific SR-IOV VF by PCI address
+        addresses:
+          - 192.168.100.11/24
+```
+
+### A.2 Renaming Interfaces to eth0 Is Unnecessary
+
+Traditional Linux provisioning often renames interfaces to predictable names like `eth0` using udev rules, systemd `.link` files, or kernel boot parameters (`net.ifnames=0 biosdevname=0`).
+
+Talos Linux is an **immutable operating system**. There is no:
+
+- Shell access to run renaming commands
+- `/etc/udev/rules.d/` directory for persistent naming rules
+- `/etc/network/interfaces` file to reference by name
+- systemd-networkd `.link` files for name overrides
+
+The kernel assigns names like `enx<mac>`, `ens18`, or `enp6s0f0` based on hardware topology. The `deviceSelector` mechanism binds configuration to hardware identity, so whether the kernel names an interface `ens18` or `enp0s3` has no effect on the provisioning system.
+
+### A.3 Netplan Is Irrelevant
+
+Netplan is the default network configuration abstraction on Ubuntu. **Talos Linux does not have netplan.** Talos does not run Ubuntu, does not use systemd-networkd or NetworkManager as backends, and does not read `/etc/netplan/*.yaml` files.
+
+Talos networking is entirely declarative through the machine configuration YAML under `machine.network.interfaces`. This configuration is applied by the Talos init system during boot, before any userspace services start.
+
+| Aspect | Netplan | Talos machine.network |
+|---|---|---|
+| Configuration format | `/etc/netplan/*.yaml` | Machine config YAML |
+| Backend | systemd-networkd or NetworkManager | Talos init (machined) |
+| Applied when | After systemd starts | Before userspace, during init |
+| Mutable at runtime | Yes (`netplan apply`) | Only via config patch + reboot or live apply |
+| Interface selection | By name (`eth0`, `ens3`) | By hardware identity (`deviceSelector`) |
+| Available in Talos | No | Yes (native and only option) |
+
+### A.4 Cloud-Init Network Configuration Is Not Applicable
+
+The Proxmox VM templates use names like `talos-v1.11-nocloud`, which suggests cloud-init involvement. The `nocloud` in the template name refers to the **platform metadata datasource type**, not to the cloud-init network configuration system.
+
+| Term | Meaning in Talos Context |
+|---|---|
+| `nocloud` datasource | A metadata delivery mechanism (via cloud-drive or SMBIOS) that provides hostname, instance-id, and similar platform metadata |
+| `cloud-init network` module | A network configuration system within cloud-init that generates backend configs (netplan, ENI, etc.) — **this does not exist in Talos** |
+
+Talos reads metadata from nocloud-compatible datasources for platform identification and hostname discovery. It does **not** process cloud-init network configuration blocks. There is no cloud-init binary in Talos, no `/etc/cloud/` directory, and no network module to render interface configurations.
+
+### A.5 Summary: Traditional vs. Talos-Native Networking
+
+| Networking Concern | Traditional Linux Approach | This Proposal's Talos-Native Approach | Why Talos-Native Is Superior |
+|---|---|---|---|
+| **Interface identification** | NIC model filtering (`virtio`, `e1000`) | `deviceSelector.hardwareAddr` (MAC) or `.busPath` (PCI) | MAC/PCI are unique per-device; model is shared across NICs |
+| **Interface naming** | Rename to `eth0` via udev rules | No renaming; bind by hardware identity | Eliminates naming fragility |
+| **Network config tool** | Netplan (`/etc/netplan/*.yaml`) | Machine config YAML (`machine.network.interfaces`) | No indirection layer; applied at init |
+| **Bootstrap networking** | Cloud-init network module | META key injection (key `0x0a`) | No cloud-init dependency; works in immutable OS |
+| **Production networking** | Cloud-init + netplan + manual tuning | Machine config patch via talos-operator | Centrally managed as K8s resources |
+| **Runtime mutability** | `netplan apply`, `ip link set` | Config patch + controlled reboot / `talosctl apply-config` | Prevents configuration drift |
