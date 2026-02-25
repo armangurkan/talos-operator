@@ -1017,7 +1017,6 @@ spec:
       memory: 16384
       bootDiskGB: 50
       dataDisks:
-<<<<<<< HEAD
         # UserVolumeConfig mounts at /var/mnt/<name> automatically
         - name: data-shard-1
           size: 24
