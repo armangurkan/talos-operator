@@ -14,7 +14,7 @@
 
 **Networking**: SR-IOV passthrough VNFs from high-speed NICs (Proxmox resource mappings) with virtio bridge fallback. **Static IP only — no DHCP.**
 
-**Management**: Supervisor K8s cluster running kubemox + talos-operator. GitOps-friendly via Crossplane v2 compositions.
+**Management**: Supervisor K8s cluster running kubemox + talos-operator. GitOps-friendly via Crossplane compositions (pipeline mode).
 
 ---
 
@@ -345,8 +345,8 @@ type VirtualMachineDisk struct {
 This only supports local Proxmox storage. No iSCSI target, no IOPS limits, no multi-disk ordering.
 
 **Talos** has no built-in mount path concept for data disks — it only knows about the install disk (`/machine/install/disk`). For persistent storage:
-- **Talos 1.8+**: `VolumeConfig` resources for **system volumes** only (`STATE`, `EPHEMERAL`, `IMAGE-CACHE`) — no filesystem or mount fields ([VolumeConfig reference](https://docs.siderolabs.com/talos/v1.11/reference/configuration/block/volumeconfig/))
-- **Talos 1.10+**: `UserVolumeConfig` for **user-defined data volumes** — supports `filesystem.type` (xfs/ext4) and auto-mounts at `/var/mnt/<name>` ([UserVolumeConfig reference](https://docs.siderolabs.com/talos/v1.12/reference/configuration/block/uservolumeconfig/))
+- **Talos 1.8+**: `VolumeConfig` resources for **system volumes** only (`STATE`, `EPHEMERAL`, `IMAGECACHE`) — no filesystem or mount fields ([VolumeConfig reference](https://docs.siderolabs.com/talos/v1.11/reference/configuration/block/volumeconfig/))
+- **Talos 1.10+**: `UserVolumeConfig` for **user-defined data volumes** — supports `filesystem.type` (xfs/ext4) and auto-mounts at `/var/mnt/<name>` ([UserVolumeConfig reference](https://docs.siderolabs.com/talos/v1.10/reference/configuration/block/uservolumeconfig/))
 - **Talos <1.10**: Use `extraMounts` in machine config for raw bind mounts (less declarative)
 
 **This proposal targets Talos v1.10+** (where `UserVolumeConfig` was introduced) with full testing on v1.11+.
@@ -434,7 +434,7 @@ Talos 1.10+ `UserVolumeConfig` allows declaring user data volumes with filesyste
 // UserVolumeConfigTemplate for data disks (Talos 1.10+)
 // Appended as multi-doc YAML after the machine config.
 // Auto-mounts at /var/mnt/<name>.
-// Ref: https://docs.siderolabs.com/talos/v1.12/reference/configuration/block/uservolumeconfig/
+// Ref: https://docs.siderolabs.com/talos/v1.10/reference/configuration/block/uservolumeconfig/
 var UserVolumeConfigTemplate = `
 ---
 apiVersion: v1alpha1
@@ -673,7 +673,7 @@ disk.transport == 'scsi' && disk.serial == 'lun-24g-001'
 
 #### Phase 4: UserVolumeConfig Mounts the Disk
 
-The `UserVolumeConfig` resource (Talos 1.10+, appended to the machine config as a multi-doc YAML) handles the full lifecycle ([UserVolumeConfig reference](https://docs.siderolabs.com/talos/v1.12/reference/configuration/block/uservolumeconfig/)):
+The `UserVolumeConfig` resource (Talos 1.10+, appended to the machine config as a multi-doc YAML) handles the full lifecycle ([UserVolumeConfig reference](https://docs.siderolabs.com/talos/v1.10/reference/configuration/block/uservolumeconfig/)):
 
 ```
 1. Boot → Talos machined enumerates disks
@@ -983,7 +983,7 @@ The IPs in `MetalSpec.Machines` must match the `NetworkSpec.IPAddress` on the co
 
 ## Crossplane Composition: GitOps Orchestration
 
-A Crossplane v2 composition provides the user-facing API — a single `TalosKubernetesCluster` Claim that generates all the underlying resources with deterministic IPs, VMIDs, and disk configs.
+A Crossplane composition (pipeline mode) provides the user-facing API — a single `TalosKubernetesCluster` Claim that generates all the underlying resources with deterministic IPs, VMIDs, and disk configs.
 
 ### The Claim (What Users Write)
 
@@ -1123,6 +1123,7 @@ spec:
         inline:
           template: |
             {{- $s := .observed.composite.resource.spec }}
+            {{- $name := .observed.composite.resource.metadata.name }}
             {{- range $i := until (int $s.controlPlane.replicas) }}
             ---
             apiVersion: proxmox.alperen.cloud/v1alpha1
@@ -1131,7 +1132,7 @@ spec:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: cp-vm-{{ $i }}
             spec:
-              name: "{{ $s.metadata.name }}-cp-{{ $i }}"
+              name: "{{ $name }}-cp-{{ $i }}"
               nodeName: {{ index $s.controlPlane.placement.nodeNames $i }}
               vmid: {{ add $s.vmidBase $i }}
               connectionRef:
@@ -1165,6 +1166,7 @@ spec:
         inline:
           template: |
             {{- $s := .observed.composite.resource.spec }}
+            {{- $name := .observed.composite.resource.metadata.name }}
             {{- $nodeCount := len $s.workers.placement.nodeNames }}
             {{- range $i := until (int $s.workers.replicas) }}
             ---
@@ -1174,7 +1176,7 @@ spec:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: wk-vm-{{ $i }}
             spec:
-              name: "{{ $s.metadata.name }}-wk-{{ $i }}"
+              name: "{{ $name }}-wk-{{ $i }}"
               nodeName: {{ index $s.workers.placement.nodeNames (mod $i $nodeCount) }}
               vmid: {{ add $s.vmidBase 10 $i }}
               connectionRef:
@@ -1244,6 +1246,7 @@ spec:
         inline:
           template: |
             {{- $s := .observed.composite.resource.spec }}
+            {{- $name := .observed.composite.resource.metadata.name }}
             {{- range $i, $m := $s.network.controlPlane.machines }}
             ---
             apiVersion: talos.alperen.cloud/v1alpha1
@@ -1255,7 +1258,7 @@ spec:
               endpoint: "{{ $m.ip }}"
               version: {{ $s.talos.version }}
               controlPlaneRef:
-                name: "{{ $s.metadata.name }}-cp"
+                name: "{{ $name }}-cp"
               networkSpec:
                 ipAddress: "{{ $m.ip }}"
                 cidr: 24
@@ -1274,7 +1277,7 @@ spec:
               endpoint: "{{ $m.ip }}"
               version: {{ $s.talos.version }}
               workerRef:
-                name: "{{ $s.metadata.name }}-workers"
+                name: "{{ $name }}-workers"
               networkSpec:
                 ipAddress: "{{ $m.ip }}"
                 cidr: 24
@@ -1375,9 +1378,9 @@ The current talos-operator uses **JSON RFC 6902 patches** exclusively (see `pkg/
 - The proposed `StaticNetworkPatch` uses **strategic merge YAML**, which is the correct approach for multi-doc scenarios.
 - **Migration consideration**: Existing JSON patches (InstallDisk, InstallImage, WipeDisk, etc.) may need to be migrated to strategic merge format when multi-doc config is used.
 
-### Talos v1.12 Network Configuration Evolution
+### Talos v1.12 Network Configuration Deprecation
 
-Talos v1.12 introduces new multi-doc network configuration documents (`LinkConfig`, `HostnameConfig`, `BondConfig`) with `AddressConfig` and `RouteConfig` as sub-fields within these documents (not standalone). These new documents **supplement** the existing `.machine.network` config rather than replace it — `.machine.network` remains fully supported. The proposed `StaticNetworkPatch` uses `.machine.network`, which works across Talos 1.10/1.11/1.12. A future enhancement could add native multi-doc network config support for 1.12+.
+Talos v1.12 introduces new standalone network configuration documents (`LinkConfig`, `HostnameConfig`, `BondConfig`) with `AddressConfig` and `RouteConfig` as sub-fields within these. The legacy `.machine.network` configuration is **deprecated** in v1.12 but remains **supported for backward compatibility**. This proposal targets Talos v1.10/v1.11 where `.machine.network` is the standard approach. A future enhancement should migrate the `StaticNetworkPatch` to the new multi-doc network config format for v1.12+.
 
 ### CEL Field Naming: snake_case vs camelCase
 
@@ -1397,9 +1400,9 @@ Every technical claim in this document has been verified against primary sources
 |---|---|---|---|---|
 | T1 | META key `0x0a` (decimal 10) provides pre-install network config | Official docs | [Metal Network Configuration](https://docs.siderolabs.com/talos/v1.11/networking/metal-network-configuration/) | VERIFIED |
 | T2 | `deviceSelector` fields: busPath, hardwareAddr, permanentAddr, pciID, driver, physical | Official docs | [Device Selector Reference](https://docs.siderolabs.com/talos/v1.11/networking/device-selector/) | VERIFIED |
-| T3 | `UserVolumeConfig` introduced in Talos 1.10+ | Official docs | [UserVolumeConfig Reference](https://docs.siderolabs.com/talos/v1.12/reference/configuration/block/uservolumeconfig/), [v1.10.0 release notes](https://github.com/siderolabs/talos/releases/tag/v1.10.0) | VERIFIED — CORRECTED from 1.11+ to 1.10+ |
+| T3 | `UserVolumeConfig` introduced in Talos 1.10+ | Official docs | [UserVolumeConfig Reference](https://docs.siderolabs.com/talos/v1.10/reference/configuration/block/uservolumeconfig/), [v1.10.0 release notes](https://github.com/siderolabs/talos/releases/tag/v1.10.0) | VERIFIED — CORRECTED from 1.11+ to 1.10+ |
 | T4 | `UserVolumeConfig` auto-mounts at `/var/mnt/<name>` with no customizable mount.path | Official docs | Same as T3 | VERIFIED |
-| T5 | `VolumeConfig` is system-only (`STATE`, `EPHEMERAL`, `IMAGE-CACHE`) | Official docs | [VolumeConfig Reference](https://docs.siderolabs.com/talos/v1.11/reference/configuration/block/volumeconfig/) | VERIFIED — CORRECTED volume names |
+| T5 | `VolumeConfig` is system-only (`STATE`, `EPHEMERAL`, `IMAGECACHE`) | Official docs | [VolumeConfig Reference](https://docs.siderolabs.com/talos/v1.11/reference/configuration/block/volumeconfig/) | VERIFIED |
 | T6 | Disk CEL properties use snake_case: `disk.bus_path`, `disk.transport`, `disk.serial`, `disk.size`, `disk.dev_path` | Source code verification | Talos DiskSpec protobuf | VERIFIED |
 | T7 | `disk.bus_path` = PCI/sysfs bus path (not kernel device path) | Source code verification | Talos DiskSpec protobuf | VERIFIED |
 | T8 | `disk.name` does NOT exist as a CEL property | Source code verification | Talos DiskSpec protobuf | VERIFIED |
@@ -1407,7 +1410,7 @@ Every technical claim in this document has been verified against primary sources
 | T10 | VIP syntax: `vip: { ip: "x.x.x.x" }` under interface config | Official docs | [Config Reference](https://docs.siderolabs.com/talos/v1.11/reference/configuration/v1alpha1/config/) | VERIFIED |
 | T11 | QEMU guest agent does NOT run in maintenance mode | GitHub issue | [siderolabs/talos#11651](https://github.com/siderolabs/talos/issues/11651) | UNVERIFIED — awaiting issue confirmation |
 | T12 | Talos v1.12 introduces standalone `LinkConfig`, `HostnameConfig`, `BondConfig`; `AddressConfig`/`RouteConfig` are sub-fields of these | Official docs | Talos v1.12 networking docs | VERIFIED — CORRECTED: AddressConfig/RouteConfig are sub-fields, not standalone |
-| T13 | `.machine.network` supplemented (not replaced) by new network config documents in v1.12 | Official docs | Talos v1.12 release notes | VERIFIED — CORRECTED: these supplement rather than deprecate .machine.network |
+| T13 | `.machine.network` deprecated in v1.12 but still supported for backward compatibility | Official docs | [Talos v1.12.0 release notes](https://github.com/siderolabs/talos/releases/tag/v1.12.0) | VERIFIED — this proposal targets v1.10/v1.11 where `.machine.network` is the standard approach |
 | T14 | Talos is immutable — no shell, no udev, no cloud-init binary | Official docs | Talos architecture documentation | VERIFIED |
 
 ### Proxmox VE Claims
@@ -1474,7 +1477,7 @@ Every technical claim in this document has been verified against primary sources
 - [Talos deviceSelector Reference](https://docs.siderolabs.com/talos/v1.11/networking/device-selector/) — `hardwareAddr`, `busPath`, `driver`, `pciID`, `permanentAddr`, `physical`
 - [Talos Configuration v1alpha1 Reference](https://docs.siderolabs.com/talos/v1.11/reference/configuration/v1alpha1/config/) — `NetworkDeviceSelector` struct
 - [Talos VolumeConfig Reference (v1.9)](https://docs.siderolabs.com/talos/v1.9/reference/configuration/block/volumeconfig/) — System volumes only (`EPHEMERAL`, `IMAGECACHE`)
-- [Talos UserVolumeConfig Reference (v1.12)](https://docs.siderolabs.com/talos/v1.12/reference/configuration/block/uservolumeconfig/) — User data volumes with filesystem and auto-mount
+- [Talos UserVolumeConfig Reference (v1.10)](https://docs.siderolabs.com/talos/v1.10/reference/configuration/block/uservolumeconfig/) — User data volumes with filesystem and auto-mount
 - [Talos Disk Management CEL Expressions](https://docs.siderolabs.com/talos/v1.11/configure-your-talos-cluster/storage-and-disk-management/disk-management/common/) — `disk.serial`, `disk.bus_path`, `disk.transport`, `disk.size`, `disk.model`
 - [Talos Static Addressing](https://docs.siderolabs.com/talos/v1.12/networking/configuration/static)
 - [Talos Nocloud Documentation](https://docs.siderolabs.com/talos/v1.8/platform-specific-installations/cloud-platforms/nocloud)
