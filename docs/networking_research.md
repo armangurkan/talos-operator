@@ -14,7 +14,7 @@
 
 **Networking**: SR-IOV passthrough VNFs from high-speed NICs (Proxmox resource mappings) with virtio bridge fallback. **Static IP only — no DHCP.**
 
-**Management**: Supervisor K8s cluster running kubemox + talos-operator. GitOps-friendly via Crossplane v2 compositions (pipeline mode).
+**Management**: Supervisor K8s cluster running kubemox + talos-operator. GitOps-friendly via Crossplane Compositions (pipeline mode).
 
 ---
 
@@ -992,7 +992,7 @@ type MetalSpec struct {
 
 ## Crossplane Composition: GitOps Orchestration
 
-A Crossplane v2 composition (pipeline mode) provides the user-facing API — a single `TalosKubernetesCluster` Claim that generates all the underlying resources with deterministic IPs, VMIDs, and disk configs.
+A Crossplane Composition (pipeline mode) provides the user-facing API — a single `TalosKubernetesCluster` Claim that generates all the underlying resources with deterministic IPs, VMIDs, and disk configs.
 
 ### The Claim (What Users Write)
 
@@ -1669,7 +1669,7 @@ TalosMachine created (with poolRef: prod-workers)
 
 ### Crossplane Integration
 
-When using Crossplane v2 compositions (pipeline mode), the `TalosKubernetesCluster` claim can reference a pool:
+When using Crossplane Compositions (pipeline mode), the `TalosKubernetesCluster` claim can reference a pool:
 
 ```yaml
 apiVersion: talos.axonnetworks.io/v1alpha1
