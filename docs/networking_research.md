@@ -1833,7 +1833,7 @@ Every technical claim in this document has been verified against primary sources
 | I2 | CAPI IPAM concurrency model is `MaxConcurrentReconciles: 1` with no distributed locks | Source code | [`internal/controllers/ipaddressclaim.go`](https://github.com/kubernetes-sigs/cluster-api-ipam-provider-in-cluster) | VERIFIED — explicit comment in source |
 | I3 | CAPI IPAM has no persistent allocation table — rebuilt from IPAddress CRs each reconciliation | Source code | `internal/controllers/ipaddressclaim.go` `EnsureAddress()` | VERIFIED |
 | I4 | CAPI IPAM uses cache consistency poll (5ms interval, 5s timeout) after allocation | Source code | `pkg/ipamutil/reconciler.go` | VERIFIED |
-| I5 | Core CAPI IPAM allocation logic is ~320 lines of Go | Source code analysis | See `capi-ipam-allocation-analysis.md` line-by-line breakdown | VERIFIED |
+| I5 | Core CAPI IPAM allocation logic is ~320 lines of Go | Source code analysis | See `archived/capi-ipam-allocation-analysis.md` line-by-line breakdown | VERIFIED |
 | I6 | `go4.org/netipx` is BSD-licensed, by Brad Fitzpatrick, ~2000 LOC, no transitive deps | Package metadata | [go4.org/netipx](https://pkg.go.dev/go4.org/netipx) | VERIFIED |
 | I7 | CAPI IPAM pool deletion protected by finalizer, only removed when `inUseCount == 0` | Source code | `internal/controllers/inclusterippool.go` `genericReconcile()` | VERIFIED |
 | I8 | CAPI IPAM status (total/used/free/outOfRange) recomputed from scratch, never incremented | Source code | Same as I7 | VERIFIED |
@@ -1899,7 +1899,7 @@ Every technical claim in this document has been verified against primary sources
 - [cluster-api-ipam-provider-in-cluster](https://github.com/kubernetes-sigs/cluster-api-ipam-provider-in-cluster) — Design reference for TalosIPPool/TalosIPAddress CRDs (allocation algorithm, concurrency model, pool status)
 - [CAPI IPAM Provider Contract](https://cluster-api.sigs.k8s.io/developer/providers/contracts/ipam) — Reference architecture for `IPAddressClaim` / `IPAddress` patterns
 - [CAPI IPAM Integration Proposal](https://github.com/kubernetes-sigs/cluster-api/blob/main/docs/proposals/20220125-ipam-integration.md) — Original design rationale
-- [CAPI IPAM Allocation Analysis](capi-ipam-allocation-analysis.md) — Source code deep-dive of CAPI IPAM allocation logic (local analysis document)
+- [CAPI IPAM Allocation Analysis](archived/capi-ipam-allocation-analysis.md) — Source code deep-dive of CAPI IPAM allocation logic (local analysis document)
 - [go4.org/netipx](https://pkg.go.dev/go4.org/netipx) — BSD-licensed IP set library (Brad Fitzpatrick), single external dependency for allocation
 
 ### Other
